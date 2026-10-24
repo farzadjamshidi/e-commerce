@@ -1,0 +1,22 @@
+# Java / Maven / Gradle
+target/
+build/
+.gradle/
+*.class
+*.jar
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+
+# Local env and secrets
+.env
+*.local.yml
+
+# Logs
+*.log
