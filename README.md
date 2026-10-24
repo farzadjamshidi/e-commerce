@@ -118,3 +118,64 @@ mean better throughput, but there is no ordering guarantee.
   partitions and ordering breaks during the change. Pick the partition count up front.
 - A hot key (one very busy entity) cannot be spread across partitions. That is the cost of
   per-key ordering.
+
+#### Step 4: Three-node cluster, RF 3, min.insync.replicas 2
+
+`docker-compose.yml` now runs three nodes (`kafka-1`, `kafka-2`, `kafka-3`). Each node is both
+broker and controller. Shared settings live in one YAML anchor (`x-kafka-env`).
+
+From this step on, CLI commands run in `kafka-1` and use the internal listener:
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 \
+  --create --topic orders --partitions 3 --replication-factor 3
+
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 \
+  --describe --topic orders
+
+docker exec kafka-1 /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server kafka-1:9092 \
+  describe --replication
+```
+
+**Listeners:** each node has three.
+
+| Listener | Port | Used by |
+|---|---|---|
+| `INTERNAL` | 9092 | Broker-to-broker replication and the CLI inside containers (`kafka-N:9092`) |
+| `CONTROLLER` | 9093 | KRaft quorum traffic between controllers |
+| `EXTERNAL` | 19092 inside, mapped to host 19092 / 29092 / 39092 | Apps on the host (`localhost:19092,localhost:29092,localhost:39092`) |
+
+A client connects to any bootstrap address, receives metadata with the *advertised* address of
+every broker, then talks to each partition leader directly. So each listener must advertise an
+address that is reachable from where the client runs. That is why containers and the host need
+different listeners. Calling `localhost:19092` from inside a container finds node 1, then fails
+on nodes 2 and 3, because `localhost:29092` inside a container is not `kafka-2`.
+
+**Replication settings:**
+
+| Setting | Value | Why |
+|---|---|---|
+| `default.replication.factor` | 3 | Every partition has a leader and two followers. |
+| `min.insync.replicas` | 2 | With `acks=all`, a write succeeds only when at least 2 replicas have it. |
+| Internal topics RF | 3 | `__consumer_offsets` and `__transaction_state` are as durable as data topics. |
+| `transaction.state.log.min.isr` | 2 | Same rule for the transaction log. |
+
+RF 3 with `min.insync.replicas=2` tolerates one broker down with no data loss and no
+unavailability. With two down, producers using `acks=all` get `NotEnoughReplicas` errors:
+Kafka chooses consistency over availability.
+
+**Observed:**
+
+```
+Partition: 0  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1
+Partition: 1  Leader: 3  Replicas: 3,1,2  Isr: 3,1,2
+Partition: 2  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3
+```
+
+- Leaders are spread across brokers, one each, so write load is balanced.
+- The first replica in the list is the *preferred leader*. Kafka moves leadership back to it
+  after a failure (`auto.leader.rebalance.enable`).
+- The KRaft quorum has 3 voters. Node 3 is the active controller; nodes 1 and 2 follow with lag 0.
+  A 3-voter quorum survives one controller failure (majority = 2).
+- External ports were checked from the host with `nc`. A real Kafka client on the host will be
+  tested with Spring Boot in a later step.
