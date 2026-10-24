@@ -68,3 +68,53 @@ column (Eligible Leader Replicas, KIP-966), which helps pick a safe leader after
 **Limitations for now:** no data volume, so `docker compose down` deletes all data.
 The advertised listener is `localhost:9092`, which works for the CLI and apps on the host,
 not for other containers.
+
+#### Step 3: Console producer and consumer, keys and partitions
+
+Produce keyed messages (`key:value` per line):
+
+```bash
+printf 'order-1:created\norder-2:created\norder-3:created\norder-1:paid\norder-2:paid\norder-1:shipped\norder-4:created\norder-5:created\n' \
+  | docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+    --topic orders --property parse.key=true --property key.separator=:
+```
+
+Consume with partition, offset and key:
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic orders --from-beginning --timeout-ms 5000 \
+  --property print.key=true --property print.partition=true --property print.offset=true
+```
+
+**Observed (keyed):**
+
+| Partition | Offset | Key | Value |
+|---|---|---|---|
+| 0 | 0 | order-2 | created |
+| 0 | 1 | order-3 | created |
+| 0 | 2 | order-2 | paid |
+| 1 | 0 | order-1 | created |
+| 1 | 1 | order-1 | paid |
+| 1 | 2 | order-1 | shipped |
+| 2 | 0 | order-4 | created |
+| 2 | 1 | order-5 | created |
+
+- The same key always lands on the same partition: `partition = murmur2(key) % numPartitions`.
+- So all events of `order-1` are read in order: created, paid, shipped.
+- Offsets are per partition. There is no global order across partitions.
+- Several keys share a partition (`order-2` and `order-3`). Ordering holds per key, but a slow
+  key can delay the others on the same partition.
+
+**Observed (no key):** three producer runs of four messages each. Every run went entirely to one
+partition, and each run picked a different partition. This is the sticky partitioner (KIP-480):
+without a key, the producer fills a batch for one partition, then switches. Fewer, larger batches
+mean better throughput, but there is no ordering guarantee.
+
+**Design takeaways:**
+
+- Use `orderId` as the key, so all events of one order stay ordered.
+- Adding partitions later changes `murmur2(key) % numPartitions`, so existing keys move to other
+  partitions and ordering breaks during the change. Pick the partition count up front.
+- A hot key (one very busy entity) cannot be spread across partitions. That is the cost of
+  per-key ordering.
