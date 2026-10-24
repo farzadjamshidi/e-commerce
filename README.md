@@ -27,3 +27,44 @@ Services, each with its own database: Order, Inventory, Payment, Shipping.
 
 **Why:** every step gets its own commit, so the history shows how the system grew
 and any step can be revisited or compared later.
+
+#### Step 2: Single Kafka broker in KRaft mode
+
+`docker-compose.yml` runs one Kafka 4.1 node using the official `apache/kafka` image.
+
+```bash
+docker compose up -d
+
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic orders --partitions 3 --replication-factor 1
+
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --describe --topic orders
+
+docker exec kafka /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server localhost:9092 \
+  describe --status
+```
+
+Key settings:
+
+| Setting | Value | Why |
+|---|---|---|
+| `KAFKA_PROCESS_ROLES` | `broker,controller` | One process plays both roles ("combined mode"). Fine locally, not in production. |
+| `KAFKA_CONTROLLER_QUORUM_VOTERS` | `1@kafka:9093` | The KRaft quorum. Here it has a single voter. |
+| `CLUSTER_ID` | fixed value | KRaft formats storage with a cluster ID. A fixed ID keeps restarts predictable. |
+| Listeners | `PLAINTEXT` 9092, `CONTROLLER` 9093 | Clients use 9092. Controller traffic is isolated on 9093. |
+| Internal topic RF | `1` | `__consumer_offsets` and `__transaction_state` default to RF 3 and would fail on one broker. |
+| `KAFKA_AUTO_CREATE_TOPICS_ENABLE` | `false` | Topics are created on purpose, with chosen partitions and RF. Typos do not create topics. |
+
+**What KRaft changes:** ZooKeeper is gone (removed in Kafka 4.0). Cluster metadata lives in an
+internal Raft log (`__cluster_metadata`) managed by controller nodes. One controller is the
+active leader; the others are hot standbys with the full metadata already in memory, so
+failover is fast and the partition count a cluster can handle is much higher.
+
+**Observed:** `describe --status` shows node 1 as the only voter and the quorum leader.
+`describe --topic` shows leader, replicas and ISR all equal to node 1, plus a new `Elr`
+column (Eligible Leader Replicas, KIP-966), which helps pick a safe leader after ISR shrinks.
+
+**Limitations for now:** no data volume, so `docker compose down` deletes all data.
+The advertised listener is `localhost:9092`, which works for the CLI and apps on the host,
+not for other containers.
