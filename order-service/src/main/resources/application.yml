@@ -1,0 +1,5 @@
+spring:
+  application:
+    name: order-service
+  kafka:
+    bootstrap-servers: localhost:19092,localhost:29092,localhost:39092

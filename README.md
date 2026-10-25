@@ -243,3 +243,55 @@ controller could remove it. Consumers only read up to the high watermark.
 - Combined mode couples broker failures and controller failures. Losing 2 of 3 nodes also lost the
   metadata quorum. Production clusters run 3 or 5 dedicated controllers, separate from brokers.
 - Alert on under-replicated partitions, offline partitions and the active controller count.
+
+#### Step 6: Spring Boot skeleton connected to Kafka
+
+`order-service/` is a Spring Boot 4.1 project (Maven wrapper, Java 25) with only
+`spring-boot-starter-kafka`. It does not produce or consume yet.
+
+Requirements: JDK 25 (Temurin 25 was installed in `~/Library/Java/JavaVirtualMachines`).
+
+```bash
+docker compose up -d
+cd order-service
+JAVA_HOME=$(/usr/libexec/java_home -v 25) ./mvnw spring-boot:run
+```
+
+`application.yml` lists all three external listeners:
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: localhost:19092,localhost:29092,localhost:39092
+```
+
+The bootstrap list is used only for the first connection. The client then gets the full broker
+list from metadata. Listing several brokers means the app can still start when one is down.
+
+`KafkaConnectionCheck` runs once at startup. It uses an `AdminClient` built from Spring's
+`KafkaAdmin` config to log the cluster ID, the active controller and each broker.
+It sends a broker-config request to every broker. Such a request goes to that broker directly,
+so a success proves every advertised `EXTERNAL` listener is reachable from the host.
+This is the real host test that step 4 left open.
+
+**Observed:**
+
+```
+Cluster id: 5L6g3nShT-eMCtK--X86sw
+Controller: 1
+Broker 1 at localhost:19092 reachable, min.insync.replicas=2
+Broker 2 at localhost:29092 reachable, min.insync.replicas=2
+Broker 3 at localhost:39092 reachable, min.insync.replicas=2
+Topics: [orders]
+```
+
+**Notes:**
+
+- The app exits after the check. There is no web server and no listener yet keeping it alive.
+- The client library is Kafka 4.2, the brokers are 4.1. Kafka clients and brokers are compatible
+  in both directions: they negotiate API versions on connect (`ApiVersions` request).
+- The generated `contextLoads` test was removed. It would need a running cluster.
+  Tests will come back with Testcontainers.
+- Spring Initializr wrote the version as `4.1.2.RELEASE`. Maven Central has it as `4.1.2`, so the pom was fixed.
+- `docker compose stop`/`start` (or a Docker restart) keeps topics and data in the containers.
+  Only `docker compose down` deletes them.
