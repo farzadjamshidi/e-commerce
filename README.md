@@ -179,3 +179,67 @@ Partition: 2  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3
   A 3-voter quorum survives one controller failure (majority = 2).
 - External ports were checked from the host with `nc`. A real Kafka client on the host will be
   tested with Spring Boot in a later step.
+
+#### Step 5: Broker failures, leader election and ISR
+
+Brokers were killed with `docker kill` (SIGKILL), which simulates a crash rather than a clean shutdown.
+
+```bash
+docker kill kafka-2
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 --describe --topic orders
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 --describe --under-replicated-partitions
+docker compose start kafka-2 kafka-3
+docker exec kafka-1 /opt/kafka/bin/kafka-leader-election.sh --bootstrap-server kafka-1:9092 \
+  --election-type preferred --all-topic-partitions
+```
+
+**A. One broker down (kafka-2 killed)**
+
+| Partition | Before | 2 s after kill | 15 s after kill |
+|---|---|---|---|
+| 0 | Leader 2, ISR 2,3,1 | unchanged | Leader 3, ISR 3,1 |
+| 1 | Leader 3, ISR 3,1,2 | unchanged | Leader 3, ISR 3,1 |
+| 2 | Leader 1, ISR 1,2,3 | unchanged | Leader 1, ISR 1,3 |
+
+- Nothing changed for a few seconds. The controller only notices a dead broker when its
+  heartbeats stop for `broker.session.timeout.ms` (9 s by default). Then it fences the broker,
+  removes it from every ISR and elects new leaders from the remaining ISR.
+- All 3 partitions were reported as under-replicated. That is the main alert for this situation.
+- Producing with `acks=all` still worked: ISR size 2 meets `min.insync.replicas=2`.
+
+**B. Two brokers down (kafka-3 killed too)**
+
+Each node is also a controller, so only 1 of 3 voters was left. The KRaft quorum lost its majority.
+
+- Metadata froze. `describe` still showed dead kafka-3 as leader and in the ISR, because no
+  active controller existed to change anything. `describe --status` on the quorum failed.
+- Partition 1 (leader kafka-3, dead): producing with `acks=1` timed out. No leader, no writes.
+- Partition 2 (leader kafka-1, alive, ISR still 1,3):
+  - `acks=all` timed out on the client after `delivery.timeout.ms`.
+  - `acks=1` succeeded on the client.
+  - The end offset stayed 0 and consumers saw nothing.
+  - `kafka-dump-log.sh` on kafka-1 showed **both** records in the leader's log at offsets 0 and 1.
+
+Why: the leader appends first, then waits for the ISR. The high watermark (the last offset
+replicated to the whole ISR) could not move, because dead kafka-3 was still in the ISR and no
+controller could remove it. Consumers only read up to the high watermark.
+
+**C. Recovery**
+
+- After `docker compose start`, all partitions were back to ISR 1,2,3 in about 14 s.
+- Every partition was first led by kafka-1, the only node that stayed up.
+- Partition 2 now showed both `order-4 paid` records at offsets 0 and 1. The `acks=all` write that
+  the client saw as **failed** was in fact stored. A client that retried it would create a duplicate.
+- The `order-1 shipped` write to partition 1 was never stored.
+- A preferred leader election moved partitions 0 and 1 back to brokers 2 and 3. Kafka also does this
+  automatically every `leader.imbalance.check.interval.seconds` (5 minutes by default).
+
+**Design takeaways:**
+
+- RF 3 with `min.insync.replicas=2` survives one broker failure with no data loss and no downtime.
+- A producer timeout does not mean "not written". It means "unknown". This is why producers enable
+  idempotence (the broker drops retried duplicates) and consumers must still be idempotent.
+- `acks=1` reports success before replication. If the leader then dies, an unreplicated record is lost.
+- Combined mode couples broker failures and controller failures. Losing 2 of 3 nodes also lost the
+  metadata quorum. Production clusters run 3 or 5 dedicated controllers, separate from brokers.
+- Alert on under-replicated partitions, offline partitions and the active controller count.
