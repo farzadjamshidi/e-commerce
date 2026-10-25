@@ -295,3 +295,49 @@ Topics: [orders]
 - Spring Initializr wrote the version as `4.1.2.RELEASE`. Maven Central has it as `4.1.2`, so the pom was fixed.
 - `docker compose stop`/`start` (or a Docker restart) keeps topics and data in the containers.
   Only `docker compose down` deletes them.
+
+#### Step 7: Simple producer with KafkaTemplate
+
+- `OrderEventProducer` wraps `KafkaTemplate<String, String>` and sends to `orders` with
+  `orderId` as the key. The value is a plain string for now (`OrderCreated`, `OrderPaid`, `OrderShipped`).
+- `DemoOrderRunner` sends the full lifecycle for three orders at startup, then calls `flush()`.
+
+**Async send:** `kafkaTemplate.send(...)` does not block. It puts the record in the producer's
+buffer and returns a `CompletableFuture<SendResult>`. A background I/O thread groups records into
+batches per partition and sends them. The callback (`whenComplete`) gets the partition and offset
+on success, or the exception after all retries fail. Blocking on every send (`.get()`) would cost
+one network round trip per record and kill throughput.
+
+**Observed:**
+
+```
+Sent OrderCreated for order-1003 -> partition 1 offset 2
+Sent OrderPaid for order-1003 -> partition 1 offset 3
+Sent OrderShipped for order-1003 -> partition 1 offset 4
+Sent OrderCreated for order-1001 -> partition 0 offset 4
+Sent OrderCreated for order-1002 -> partition 0 offset 5
+Sent OrderPaid for order-1001 -> partition 0 offset 6
+Sent OrderPaid for order-1002 -> partition 0 offset 7
+Sent OrderShipped for order-1001 -> partition 0 offset 8
+Sent OrderShipped for order-1002 -> partition 0 offset 9
+```
+
+- The code sent records in the order created-paid-shipped, round by round across orders.
+  Callbacks for partition 1 finished first. Callbacks across partitions have no ordering.
+- Within each partition, each order's events are in order. The console consumer confirmed
+  the same order on the broker.
+- `order-1001` and `order-1002` share partition 0, but their events interleave correctly.
+
+**Producer defaults in Kafka 4 clients** (from the `ProducerConfig` log, no settings changed):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `acks` | `-1` (`all`) | Wait for all ISR replicas |
+| `enable.idempotence` | `true` | The broker drops duplicates caused by producer retries |
+| `retries` | `2147483647` | Retry until `delivery.timeout.ms` (2 min) runs out |
+| `max.in.flight.requests.per.connection` | `5` | Up to 5 unacknowledged batches per broker; idempotence keeps them ordered |
+| `linger.ms` | `5` | Wait up to 5 ms to fill a batch (was 0 before Kafka 4.0) |
+| `batch.size` | `16384` | Max batch size in bytes per partition |
+
+The safe settings (`acks=all`, idempotence) have been the default since Kafka 3.0.
+The next step makes them explicit and tests what each one does.
