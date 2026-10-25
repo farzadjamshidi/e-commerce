@@ -428,3 +428,76 @@ That is another reason to set it explicitly.
 - `linger.ms` trades latency for efficiency at low traffic. `batch.size` caps batches at high traffic.
 - Measure with the producer's own metrics: `batch-size-avg`, `records-per-request-avg`,
   `request-latency-avg`, `record-error-rate`.
+
+#### Step 9: Simple consumer with @KafkaListener
+
+The consumer lives in a new service, `inventory-service/`, not in `order-service`. In the scenario,
+Inventory reacts to order events, so service boundaries are right from the start. It is generated
+the same way as `order-service` (Spring Boot 4.1, Java 25, `spring-boot-starter-kafka`).
+
+```bash
+cd inventory-service
+JAVA_HOME=$(/usr/libexec/java_home -v 25) ./mvnw spring-boot:run
+```
+
+```yaml
+spring:
+  kafka:
+    consumer:
+      group-id: inventory-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+```
+
+- `group-id` is the service name. Every instance of Inventory joins the same group, and Kafka splits
+  partitions between them. Another service (Payment) would use its own group and get every event too.
+- `auto-offset-reset: earliest` applies only when the group has **no committed offset** for a
+  partition. A new group reads from the beginning instead of only new events (`latest`, the default).
+
+`OrderEventListener` receives a `ConsumerRecord` and logs value, key, partition and offset.
+
+**What `@KafkaListener` hides:** it is Spring's wrapper around `KafkaConsumer`, like `KafkaTemplate`
+is around `KafkaProducer`. A listener container owns a consumer thread that runs the poll loop:
+`poll()` up to `max.poll.records` (500), call the method once per record, commit offsets, poll again.
+These container threads are non-daemon, so the app keeps running, unlike `order-service`.
+
+**Observed:**
+
+- On first start the group had no offsets, so it read all 26 existing records from offset 0.
+  The single consumer got all three partitions: `partitions assigned: [orders-0, orders-1, orders-2]`.
+- Order was kept per partition, not globally. All of partition 1 came first, then 0, then 2.
+- New events from a fresh `order-service` run arrived within milliseconds.
+- The topic already contains duplicates: `order-1003`'s lifecycle appears more than once because the
+  demo producer ran more than once, and `order-4 paid` twice from the failed `acks=all` write in step 5.
+  The consumer cannot tell them apart from new events yet.
+
+```
+TOPIC   PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+orders  0          22              22              0
+orders  1          11              11              0
+orders  2          2               2               0
+
+GROUP              COORDINATOR   ASSIGNMENT-STRATEGY  STATE   #MEMBERS
+inventory-service  kafka-3:9092  range                Stable  1
+```
+
+- Lag = log-end offset minus committed offset. Zero means the group is up to date.
+- The committed offset is the **next** offset to read (22), not the last one processed (21).
+- The group coordinator is kafka-3: the leader of the `__consumer_offsets` partition for
+  `hash("inventory-service") % 50`.
+- After a restart the consumer logged `Setting offset for partition orders-0 to the committed offset 22`
+  and processed nothing again. `auto-offset-reset` was ignored because offsets existed.
+
+**Defaults worth knowing** (from the `ConsumerConfig` log):
+
+| Setting | Value | Meaning |
+|---|---|---|
+| `enable.auto.commit` | `false` | Spring sets this. The container commits, not a background timer in the client. |
+| Spring `AckMode` | `BATCH` | Offsets are committed after all records from one `poll()` are processed. |
+| `max.poll.records` | `500` | Records returned by one `poll()` |
+| `group.protocol` | `classic` | The old rebalance protocol. KIP-848 (`consumer`) must be enabled explicitly. |
+| `partition.assignment.strategy` | `Range`, `CooperativeSticky` | `range` is used. Compared in a later step. |
+
+With `AckMode.BATCH`, a crash in the middle of a batch means the whole batch is read again after
+restart. That is at-least-once delivery. The next step makes commits manual and shows it.
