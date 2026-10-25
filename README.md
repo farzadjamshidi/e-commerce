@@ -341,3 +341,90 @@ Sent OrderShipped for order-1002 -> partition 0 offset 9
 
 The safe settings (`acks=all`, idempotence) have been the default since Kafka 3.0.
 The next step makes them explicit and tests what each one does.
+
+#### Step 8: Explicit producer settings and their effect
+
+`application.yml` now states every producer setting that matters, even where it equals the default.
+Defaults change between versions (`linger.ms` went from 0 to 5 in Kafka 4.0), and explicit config
+documents intent.
+
+```yaml
+spring:
+  kafka:
+    producer:
+      acks: all
+      batch-size: 16384
+      properties:
+        "[enable.idempotence]": true
+        "[max.in.flight.requests.per.connection]": 5
+        "[linger.ms]": 5
+        "[delivery.timeout.ms]": 120000
+        "[request.timeout.ms]": 30000
+```
+
+The `"[...]"` brackets keep the dots inside the map key, so Spring passes `linger.ms` to the Kafka
+client as one property name.
+
+**Benchmark:** `ProducerBenchmark` runs only with the `bench` profile (`DemoOrderRunner` is now
+`!bench`). It sends N records of 200 bytes to the `producer-bench` topic (3 partitions, RF 3) with
+1000 distinct keys, flushes, then prints throughput and producer metrics from `kafkaTemplate.metrics()`.
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 \
+  --create --topic producer-bench --partitions 3 --replication-factor 3
+
+cd order-service
+JAVA_HOME=$(/usr/libexec/java_home -v 25) ./mvnw package -DskipTests
+java -jar target/order-service-0.0.1-SNAPSHOT.jar --spring.profiles.active=bench \
+  --bench.records=200000 "--spring.kafka.producer.properties[linger.ms]=0"
+```
+
+Options: `--bench.records`, `--bench.payload-bytes`, `--bench.pause-micros` (pause between sends to simulate low load).
+
+**A. High load: 200,000 records, as fast as possible** (second of two runs, local Docker, numbers vary)
+
+| Config | Time (ms) | Records/s | Avg batch (bytes) | Records/request | Requests |
+|---|---|---|---|---|---|
+| `linger.ms=0` | 1079 | 185k | 16,039 | 73 | 2,736 |
+| `linger.ms=5` (default) | 964 | 207k | 16,193 | 74 | 2,710 |
+| `linger.ms=20`, `batch.size=64KB` | 441 | 454k | 65,143 | 298 | 679 |
+| `acks=1`, idempotence off | 721 | 277k | 16,193 | 74 | 2,709 |
+
+- Under high load, `linger.ms` barely matters. Batches fill to `batch.size` while earlier
+  requests are still in flight, so batching happens anyway.
+- `batch.size` is the lever under high load: 4x bigger batches, 4x fewer requests, about 2x throughput.
+- `acks=1` was about 35% faster, because the leader answers without waiting for followers.
+  Step 5 showed the price: an acknowledged record can be lost if the leader dies.
+
+**B. Low load: 2,000 records, ~1 ms pause between sends**
+
+| `linger.ms` | Avg batch (bytes) | Records/request | Requests | Request latency (ms) |
+|---|---|---|---|---|
+| 0 | 279 | 1.0 | 2,006 | 0.6 |
+| 5 | 532 | 2.2 | 932 | 1.0 |
+| 20 | 1,398 | 6.1 | 333 | 2.5 |
+
+- Under low load, `linger.ms` decides batching. With 0, every record is its own request.
+  With 20, there are 6x fewer requests, at the cost of up to 20 ms extra latency per record.
+- Requests go per broker. Each of the 3 brokers leads one partition, so a request carries about
+  a third of the records sent during the linger window.
+
+**C. Config validation**
+
+```
+--spring.kafka.producer.acks=1   (with enable.idempotence=true)
+ConfigException: Must set acks to all in order to use the idempotent producer.
+```
+
+Idempotence needs `acks=all`, `retries > 0` and `max.in.flight.requests.per.connection <= 5`.
+When idempotence is set explicitly, the client refuses a conflicting config at startup instead of
+silently weakening it. When it is left at the default, the client turns idempotence off quietly.
+That is another reason to set it explicitly.
+
+**Design takeaways:**
+
+- Keep `acks=all` and idempotence for business events. Tune throughput with `batch.size`,
+  `linger.ms` and compression, not by weakening durability.
+- `linger.ms` trades latency for efficiency at low traffic. `batch.size` caps batches at high traffic.
+- Measure with the producer's own metrics: `batch-size-avg`, `records-per-request-avg`,
+  `request-latency-avg`, `record-error-rate`.
