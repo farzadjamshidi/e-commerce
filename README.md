@@ -501,3 +501,61 @@ inventory-service  kafka-3:9092  range                Stable  1
 
 With `AckMode.BATCH`, a crash in the middle of a batch means the whole batch is read again after
 restart. That is at-least-once delivery. The next step makes commits manual and shows it.
+
+#### Step 10: Manual commit and crash test
+
+`OrderEventListener` now takes an `Acknowledgment` and calls `ack.acknowledge()` after processing.
+`application.yml` sets the container ack mode:
+
+```yaml
+spring:
+  kafka:
+    listener:
+      ack-mode: manual_immediate
+```
+
+A test-only property `inventory.processing-delay-ms` (default 0) slows each record down, so the
+process can be killed in the middle of a batch.
+
+**Crash test:** produce 20 new records, start the consumer with a 300 ms delay per record,
+`kill -9` it after 5 records (a crash, no shutdown hooks), restart it, and compare which
+partition/offset pairs were processed in both runs.
+
+| Ack mode | Processed before crash | Committed before crash | Processed again after restart |
+|---|---|---|---|
+| `BATCH` (Spring default) | 5 | 0 | **5** (all of them) |
+| `MANUAL_IMMEDIATE` | 5 | 5 | **0** |
+
+- With `BATCH`, offsets are committed only after every record from one `poll()` is processed.
+  A crash in the middle loses the commit for the whole batch, so all of it is redelivered.
+  With up to 500 records per poll, that can be hundreds of duplicates.
+- With `MANUAL_IMMEDIATE`, each `acknowledge()` commits that record's offset synchronously.
+  At most one record can be redelivered: one that was processed but not yet acknowledged.
+  In this run the kill landed after the 5th ack, so there were no duplicates.
+  The window still exists, so this is still at-least-once.
+
+**Ack modes in Spring Kafka:**
+
+| Mode | When offsets are committed |
+|---|---|
+| `RECORD` | After each record returns, by the container |
+| `BATCH` | After all records of one poll are processed (default) |
+| `TIME` / `COUNT` | After a time interval or a number of records |
+| `MANUAL` | On `acknowledge()`, but queued and committed together after the poll |
+| `MANUAL_IMMEDIATE` | On `acknowledge()`, committed right away |
+
+`MANUAL` lets the code decide *which* records count as done, but commits in bulk.
+`MANUAL_IMMEDIATE` gives the smallest redelivery window but sends one synchronous commit per
+record, which costs throughput. It is a trade-off, not a free win.
+
+**Order matters:** process first, commit second. Committing before processing turns a crash into
+a lost message (at-most-once). Processing before committing turns a crash into a duplicate
+(at-least-once). Duplicates can be handled with idempotency (Phase 2); lost messages cannot be recovered.
+No commit strategy alone gives exactly-once. That needs an idempotent consumer, or committing the
+offset in the same transaction as the result.
+
+**Side finding: restart took 43-45 seconds.** After `kill -9`, the dead member stays in the group
+until `session.timeout.ms` (45 s by default) passes without heartbeats. The coordinator waits for it
+before finishing the rebalance, so the new instance gets no partitions until then. A clean shutdown
+(SIGTERM) sends a `LeaveGroup` request and the rebalance starts at once. Static membership and the
+new rebalance protocol change this; that is the next step.
