@@ -559,3 +559,94 @@ until `session.timeout.ms` (45 s by default) passes without heartbeats. The coor
 before finishing the rebalance, so the new instance gets no partitions until then. A clean shutdown
 (SIGTERM) sends a `LeaveGroup` request and the rebalance starts at once. Static membership and the
 new rebalance protocol change this; that is the next step.
+
+#### Step 11: Rebalancing: eager, cooperative, KIP-848 and static membership
+
+A rebalance moves partitions between members of a consumer group: when a member joins, leaves, or
+dies, or when partitions are added. The experiments start three `inventory-service` instances
+(A, then B, then C, 6 s apart) on the 3-partition `orders` topic and record every
+`partitions revoked` / `partitions assigned` callback. Each run uses its own group.
+
+```bash
+java -jar target/inventory-service-0.0.1-SNAPSHOT.jar --spring.kafka.consumer.group-id=rb-range \
+  "--spring.kafka.consumer.properties[partition.assignment.strategy]=org.apache.kafka.clients.consumer.RangeAssignor"
+java -jar target/inventory-service-0.0.1-SNAPSHOT.jar --spring.kafka.consumer.group-id=rb-coop \
+  "--spring.kafka.consumer.properties[partition.assignment.strategy]=org.apache.kafka.clients.consumer.CooperativeStickyAssignor"
+java -jar target/inventory-service-0.0.1-SNAPSHOT.jar --spring.kafka.consumer.group-id=rb-kip848 \
+  "--spring.kafka.consumer.properties[group.protocol]=consumer"
+```
+
+**A. Range assignor (classic protocol, eager)**
+
+| Event | A | B | C |
+|---|---|---|---|
+| A starts | assigned 0,1,2 | | |
+| B joins | **revoked 0,1,2**, assigned 0,1 | assigned 2 | |
+| C joins | **revoked 0,1**, assigned 0 | **revoked 2**, assigned 2 | assigned 1 |
+
+Every rebalance is stop-the-world. All members give up all partitions, wait for the whole group
+to sync, then get a new assignment. B gave up partition 2 only to get partition 2 back.
+Locally the gap was ~30 ms, but in production every member must first finish its current batch and
+rejoin, so the pause can last up to `max.poll.interval.ms`.
+
+**B. CooperativeStickyAssignor (classic protocol, incremental)**
+
+| Event | A | B | C |
+|---|---|---|---|
+| A starts | assigned 0,1,2 | | |
+| B joins | revoked **2** only | assigned 2 (3 s later) | |
+| C joins | revoked **1** only | untouched | assigned 1 (3 s later) |
+
+Only the partitions that move are revoked. A kept processing 0 and 1 the whole time. It takes two
+rebalance rounds: the first revokes the moving partition, the second assigns it. The ~3 s gap matches
+`heartbeat.interval.ms` (3 s): members most likely learn about the second round on their next heartbeat.
+
+**C. KIP-848 (`group.protocol=consumer`)**
+
+| Event | A | B | C |
+|---|---|---|---|
+| A starts | assigned 0,1,2 | | |
+| B joins | revoked **2** only | assigned 2 (1.3 s later) | |
+| C joins | revoked **1** only | untouched | assigned 1 (2.7 s later) |
+
+Also incremental, but the design is different:
+
+- The **broker** (group coordinator) computes the assignment. In the classic protocol a client,
+  the group leader, does it. The client setting is `group.remote.assignor` (`uniform` or `range`);
+  `partition.assignment.strategy` is not allowed with this protocol.
+- There is no group-wide `JoinGroup`/`SyncGroup` barrier. Each member reconciles on its own through
+  heartbeats, so a slow member does not block the others.
+- The broker must support it: `kafka-features.sh describe` shows `group.version` level 1, the
+  default since Kafka 4.0. Clients still default to `classic`.
+
+**D. Static membership: kill -9 B, restart it after 1 s** (range assignor)
+
+| | Without `group.instance.id` | With `group.instance.id=inventory-B` |
+|---|---|---|
+| Time until restarted B got partitions | **45 s** | **2 s** |
+| B's partition while B was down | unprocessed for 45 s | unprocessed for ~2 s |
+| A and C | revoked and reassigned, partitions moved | untouched |
+| B after restart | got a different partition | got the same partition back |
+
+Without static membership, the new B is a new member. The coordinator waits for the dead member's
+`session.timeout.ms` (45 s) to expire, then runs a full rebalance. With static membership, the new B
+rejoins with the same instance ID. The coordinator replaces the old member, returns its cached
+assignment, and does not rebalance at all. This fixes the 45 s wait seen in step 10.
+
+The cost: a static member that leaves for good is only removed after `session.timeout.ms`, so its
+partitions sit idle until then. Each instance needs a stable, unique ID across restarts, e.g. the pod
+name of a Kubernetes StatefulSet. Two instances with the same ID fence each other.
+
+**Decision for this project:** `inventory-service` now uses `group.protocol=consumer` by default.
+The existing `inventory-service` group was empty, so the coordinator converted it from `Classic` to
+`Consumer` on first join and kept its offsets. Static membership will be added with Kubernetes in
+Phase 4, where stable pod names exist.
+
+**Interview summary:**
+
+| | Eager (range, round-robin) | Cooperative sticky | KIP-848 |
+|---|---|---|---|
+| Who assigns | Group leader (client) | Group leader (client) | Broker |
+| Revokes on rebalance | All partitions | Only moving ones | Only moving ones |
+| Group-wide barrier | Yes | Yes, two rounds | No |
+| Slow member blocks others | Yes | Yes | No |
