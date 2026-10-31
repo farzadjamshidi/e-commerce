@@ -650,3 +650,108 @@ Phase 4, where stable pod names exist.
 | Revokes on rebalance | All partitions | Only moving ones | Only moving ones |
 | Group-wide barrier | Yes | Yes, two rounds | No |
 | Slow member blocks others | Yes | Yes | No |
+
+#### Step 12: Retention vs compaction
+
+A partition is stored as a series of **segment** files. Only the newest one, the *active* segment,
+receives writes. Both cleanup policies work on closed segments only.
+
+```
+retention-demo-0/
+  00000000000000000000.log   offsets 0-4    (closed)
+  00000000000000000005.log   offsets 5-9    (closed)
+  00000000000000000010.log   offsets 10-14  (active)
+```
+
+The file name is the first offset in the segment. A segment closes when it reaches
+`segment.bytes` (1 GiB default) or `segment.ms` (7 days default) and a new record arrives.
+
+**A. Retention (`cleanup.policy=delete`, the default)**
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 --create \
+  --topic retention-demo --partitions 1 --replication-factor 3 \
+  --config retention.ms=30000 --config segment.ms=10000
+```
+
+Three batches of 5 records were sent 12 s apart, so each went into its own segment.
+
+| Time | Earliest offset | Latest offset | Segments |
+|---|---|---|---|
+| 22:20:48, last batch sent | 0 | 15 | 0, 5, 10 |
+| 22:22:53, all data older than 30 s | 0 | 15 | 0, 5, 10 |
+| 22:25:40 | **15** | 15 | 0, 5, 10 marked `.deleted`, new empty 15 |
+
+- Retention deletes whole segments, never single records. A segment goes when its newest record
+  is older than `retention.ms` (or the partition is over `retention.bytes`).
+- Nothing happened for about 5 minutes after the data expired. The broker only checks every
+  `log.retention.check.interval.ms` (5 min). Retention is a lower bound, not an exact time.
+- Even the active segment was removed: when all of it is expired, Kafka rolls a new empty segment
+  so the old one can be deleted.
+- Files are first renamed to `.deleted` and removed after `file.delete.delay.ms` (60 s).
+- Offsets never restart. The log start offset moved to 15 and the next record will get offset 15.
+
+**Why it matters for consumers:** if a consumer group falls behind further than retention, its
+committed offset points to deleted data. The consumer gets an out-of-range error and
+`auto.offset.reset` decides: `earliest` skips to the oldest remaining record, `latest` jumps to the end.
+Either way, messages are lost for that group. Alert on lag long before it reaches retention.
+
+**B. Compaction (`cleanup.policy=compact`)**
+
+```bash
+docker exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 --create \
+  --topic stock-levels --partitions 1 --replication-factor 3 \
+  --config cleanup.policy=compact --config segment.ms=5000 \
+  --config min.cleanable.dirty.ratio=0.01 --config min.compaction.lag.ms=0 \
+  --config delete.retention.ms=20000
+```
+
+Stock updates per SKU, then a tombstone (a record with a `null` value) for `sku-3`.
+The console producer sends `null` with `--property null.marker=NULL`.
+
+| Offset | Before | After 1st cleaning | After 2nd cleaning |
+|---|---|---|---|
+| 0 | sku-1 = 10 | | |
+| 1 | sku-2 = 5 | | |
+| 2 | sku-1 = 9 | | |
+| 3 | sku-3 = 7 | | |
+| 4 | sku-1 = 8 | sku-1 = 8 | |
+| 5 | sku-2 = 4 | sku-2 = 4 | sku-2 = 4 |
+| 6 | sku-3 = 6 | | |
+| 7 | sku-3 = null | sku-3 = null | |
+| 8 | sku-4 = 1 | sku-4 = 1 | sku-4 = 1 |
+| 9 | | | sku-1 = 7 |
+| 10 | | | sku-2 = 3 (active segment) |
+
+- Compaction keeps the **latest value per key** and removes older ones. Offsets do not change;
+  gaps appear instead. Order of the remaining records is kept.
+- A tombstone deletes a key. It stays for `delete.retention.ms` after cleaning, so consumers that
+  are reading can still see the delete. It was gone after the next cleaning, and `sku-3` with it.
+- The cleaner only runs when there is new "dirty" data, so the second cleaning needed new records.
+- `sku-2` appears twice at the end: offset 10 is in the active segment, which is never compacted.
+  A compacted topic guarantees *at least* the latest value per key, not *only* the latest.
+- Settings like `min.cleanable.dirty.ratio=0.01` and `segment.ms=5000` are for the demo only.
+  Production defaults (0.5 ratio, 7 day segments) avoid constant rewriting.
+
+**When to use which:**
+
+| | Retention (delete) | Compaction |
+|---|---|---|
+| Keeps | Everything, for a time or size | The latest value per key, forever |
+| Records are | Events: "order 1001 was paid" | State: "stock of sku-1 is 7" |
+| Typical use | Order and payment events, logs | `__consumer_offsets`, changelog topics, reference data, CDC snapshots |
+| A new consumer can | Replay recent history | Rebuild the full current state |
+
+`cleanup.policy=compact,delete` combines both: latest value per key, but nothing older than retention.
+
+**Design takeaways:**
+
+- Event topics like `orders` use retention. Keys matter for ordering, not for cleanup.
+- Use compaction only when the key is the identity of the thing and the value is its full state.
+  A compacted topic of partial updates loses information.
+- Deleting with tombstones needs the consumer to handle `null` values.
+- Both policies give a *minimum* guarantee in time. Neither runs at an exact moment.
+
+Both demo topics were deleted after the test.
+
+**Phase 1 is complete.**
