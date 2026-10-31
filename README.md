@@ -755,3 +755,49 @@ The console producer sends `null` with `--property null.marker=NULL`.
 Both demo topics were deleted after the test.
 
 **Phase 1 is complete.**
+
+### Phase 2: Reliable order flow
+
+#### Step 1: PostgreSQL with one database per service
+
+`docker-compose.yml` now also runs PostgreSQL 18. `infra/postgres/init.sql` creates one database
+and one user per service:
+
+| Database | Owner | Used by |
+|---|---|---|
+| `order_db` | `order_service` | Order service |
+| `inventory_db` | `inventory_service` | Inventory service |
+
+```bash
+docker compose up -d postgres
+docker exec -e PGPASSWORD=order_service postgres psql -h localhost -U order_service -d order_db
+```
+
+**Database per service:** each service owns its data, and other services can reach it only
+through events or APIs. Shared tables would couple deployments, schemas and failures.
+This is the reason the order flow needs Kafka and, soon, the outbox pattern: one service cannot
+update another service's data in the same local transaction.
+
+**Enforced, not just agreed:** `REVOKE CONNECT ... FROM PUBLIC` means a user can only connect to
+the database it owns.
+
+```
+order_service -> order_db       OK
+order_service -> inventory_db   FATAL: permission denied for database "inventory_db"
+inventory_service -> order_db   FATAL: permission denied for database "order_db"
+```
+
+Locally, one PostgreSQL server hosts all databases to save resources. In production each service
+would usually get its own instance (or at least its own logical database with separate credentials),
+so load, upgrades and outages stay isolated.
+
+**Details:**
+
+- Data is in the named volume `postgres-data`. Removing and recreating the container kept a test
+  row. Unlike Kafka, `docker compose down` keeps it (`down -v` deletes it).
+- `init.sql` runs only when the data directory is empty, i.e. on the very first start. To rerun it,
+  delete the volume. Changes to existing databases need a migration tool later (Flyway).
+- PostgreSQL 18 images store data in a version-specific folder under `/var/lib/postgresql`, so the
+  volume is mounted there, not at `/var/lib/postgresql/data` as in older images.
+- The health check (`pg_isready`) lets other containers wait until the database accepts connections.
+- Passwords are plain text in the repo because this is a local lab. Real deployments use secrets.
