@@ -847,3 +847,64 @@ spring:
 
 The index on `customer_id` supports "orders of a customer" queries.
 There is no entity or repository yet. That comes with the first API.
+
+#### Step 3: Place-order API (202 Accepted, status PENDING)
+
+`order-service` is now a web app on port **8081** (`spring-boot-starter-webmvc`,
+`spring-boot-starter-validation`). It no longer exits after startup.
+`DemoOrderRunner` was removed: orders now come from the API. The `bench` profile turns the web
+server off (`application-bench.yml`), so the producer benchmark still exits when done.
+
+```bash
+cd order-service
+JAVA_HOME=$(/usr/libexec/java_home -v 25) ./mvnw spring-boot:run
+
+curl -i -X POST localhost:8081/orders -H 'Content-Type: application/json' \
+  -d '{"customerId":"customer-42","sku":"laptop-pro-14","quantity":2,"unitPrice":1499.99,"currency":"EUR"}'
+
+curl -i localhost:8081/orders/{orderId}
+```
+
+| Request | Response |
+|---|---|
+| `POST /orders` (valid) | `202 Accepted`, `Location: /orders/{id}`, body with `"status":"PENDING"` |
+| `GET /orders/{id}` | `200 OK` with the current order |
+| `GET /orders/{unknown}` | `404 Not Found` |
+| `POST /orders` (blank customer, quantity 0, negative price, lowercase currency) | `400 Bad Request` as RFC 9457 Problem Details |
+
+**Why 202 and not 201:** the order is stored, but it is not done. Stock must be reserved and payment
+taken by other services, asynchronously. `202 Accepted` says "received, still processing".
+`Location` points to where the client can check the status. Later steps push status changes to the
+client (SSE or WebSocket) instead of making it poll.
+
+**Code:**
+
+| Class | Role |
+|---|---|
+| `OrderController` | `POST /orders`, `GET /orders/{id}`. Request and response are records, validated with Bean Validation |
+| `OrderService` | `@Transactional` use cases: `placeOrder`, `findOrder` |
+| `Order` | JPA entity. `Order.place(...)` creates a valid `PENDING` order and computes `totalAmount` |
+| `OrderRepository` | Spring Data `JpaRepository<Order, UUID>` |
+| `OrderStatus` | `PENDING`, `CONFIRMED`, `CANCELLED` |
+
+**Details:**
+
+- `ddl-auto: validate` now checks the entity against the Flyway table at startup, and it passed.
+  `currency` needed `columnDefinition = "bpchar(3)"` because `CHAR(3)` is not Hibernate's default for a `String`.
+- The ID is a `UUID` set in `Order.place(...)`. Normally Spring Data would treat an entity with an ID
+  as existing and call `merge`, which runs a `SELECT` first. `@Version Long version` is `null` for a new
+  entity, which tells Spring Data to `persist` instead. The SQL log showed one `INSERT` and no `SELECT`.
+  Hibernate starts the version at 0.
+- The entity is not exposed by the API. `OrderResponse` is a separate record, so the API contract
+  and the table can change independently.
+- `open-in-view: false` matters now that there is a web layer.
+
+**Simplifications to revisit:**
+
+- The client sends `unitPrice`. A real order service would take the price from a catalog or pricing
+  service, never trust the client.
+- A client that retries a timed-out `POST` creates a second order. The usual fix is an
+  `Idempotency-Key` header stored with the order. This is the same at-least-once problem as in Kafka,
+  at the API edge.
+- The `400` response says "Invalid request content" without field details.
+- No event is published yet. The next steps add that, reliably.
