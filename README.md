@@ -908,3 +908,75 @@ client (SSE or WebSocket) instead of making it poll.
   at the API edge.
 - The `400` response says "Invalid request content" without field details.
 - No event is published yet. The next steps add that, reliably.
+
+#### Step 4: Transactional outbox table
+
+**The problem: dual write.** Placing an order must do two things: store the order in PostgreSQL and
+publish `OrderCreated` to Kafka. These are two systems with no shared transaction.
+
+| Approach | Failure | Result |
+|---|---|---|
+| Save order, then send to Kafka | Crash after the commit, before the send | Order exists, no event. Inventory never hears about it |
+| Send to Kafka, then save order | Commit fails after the send | Event for an order that does not exist |
+| Send inside `@Transactional` | Kafka send succeeds, DB rolls back | Same as above. Kafka is not part of the DB transaction |
+
+**The outbox pattern:** write the event as a row in an `outbox_events` table **in the same database
+transaction** as the order. Both commit or neither does. A separate relay reads the table and
+publishes to Kafka later (next steps). The database becomes the single source of truth for
+"what must be published".
+
+`V2__create_outbox_events.sql`:
+
+| Column | Purpose |
+|---|---|
+| `id` | Event ID (UUID). Consumers use it to detect duplicates |
+| `position` | Identity column. The order in which the relay publishes |
+| `aggregate_type`, `aggregate_id` | `Order` and the order ID. `aggregate_id` becomes the Kafka key, so one order's events stay ordered |
+| `event_type` | `OrderCreated` |
+| `payload` | The event as `JSONB` |
+| `created_at`, `published_at` | `published_at` stays `NULL` until the relay has published it |
+
+A partial index on `position WHERE published_at IS NULL` keeps the relay's query fast even when the
+table holds millions of published rows.
+
+`OrderService.placeOrder` now saves the order and an `OutboxEvent` in one `@Transactional` method.
+`OrderCreatedEvent` is a record serialized with Jackson 3's `JsonMapper`. It carries `eventId`,
+`eventType`, `occurredAt`, the order data, and `orderVersion` (the order's `version` column).
+
+**Observed:**
+
+```
+insert into orders (...)
+insert into outbox_events (...)
+```
+
+```
+position | aggregate_type | aggregate_id                         | event_type   | published_at
+       1 | Order          | f648986f-b3d5-4986-adc6-0e4960d51ed0 | OrderCreated | (null)
+```
+
+**Atomicity test:** `REVOKE INSERT ON outbox_events FROM order_service`, then `POST /orders`.
+
+| | Orders | Outbox events |
+|---|---|---|
+| Before | 3 | 1 |
+| `POST` with outbox insert failing: `500`, `permission denied for table outbox_events` | 3 | 1 |
+| After `GRANT` again, `POST`: `202` | 4 | 2 |
+
+The order insert was rolled back together with the failed outbox insert. There is no order without
+its event. The error came at commit time, not at `save()`: Hibernate queues inserts and sends
+them when the transaction flushes.
+
+**Details:**
+
+- `OutboxEvent` implements `Persistable<UUID>`. Its ID is preset and it has no `@Version`, so Spring
+  Data could not tell it is new and would run a `SELECT` before every insert. A transient `isNew`
+  flag, cleared after persist or load, fixes that. The SQL log shows two inserts and no select.
+- `position` is filled by the database (`insertable = false, updatable = false`).
+- The orders created in step 3 have no outbox events. They were placed before the outbox existed.
+
+**Known limit of `position`:** identity values are assigned at insert, not at commit. Two concurrent
+transactions can commit in the opposite order of their positions, so a relay that remembers "last
+position seen" could skip a row that commits late. The relay in the next step avoids that by
+selecting by `published_at IS NULL` instead of by position. Ordering per order is safe, because
+events of one order are written one transaction at a time.
