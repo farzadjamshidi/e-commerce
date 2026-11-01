@@ -980,3 +980,80 @@ transactions can commit in the opposite order of their positions, so a relay tha
 position seen" could skip a row that commits late. The relay in the next step avoids that by
 selecting by `published_at IS NULL` instead of by position. Ordering per order is safe, because
 events of one order are written one transaction at a time.
+
+#### Step 5: Polling relay
+
+`OutboxRelay` is a `@Scheduled` job in `order-service` (`@EnableScheduling` on the application class).
+Every 500 ms, in one database transaction, it:
+
+1. Tries `pg_try_advisory_xact_lock(4242001)`. If another relay holds it, it skips this round.
+2. Selects up to 100 rows `WHERE published_at IS NULL ORDER BY position`.
+3. Sends each to Kafka: topic from `aggregate_type` (`Order` -> `orders`), key = `aggregate_id`,
+   value = `payload`, headers `eventId` and `eventType`.
+4. Waits until Kafka acknowledged **every** record of the batch.
+5. Sets `published_at` on those rows and commits.
+
+If any send fails, the method throws, the transaction rolls back, and the rows are picked up again
+on the next round.
+
+```yaml
+outbox:
+  relay:
+    poll-interval-ms: 500
+    batch-size: 100
+```
+
+The relay is disabled in the `bench` profile, so the benchmark still exits.
+
+**Why the advisory lock:** with two `order-service` instances, two relays could each take a batch.
+If one order's events land in different batches, the second relay can publish the later event first.
+A transaction-scoped advisory lock lets only one relay work at a time across all instances. It is
+released automatically on commit or rollback, so a crashed instance cannot keep it.
+
+**Tests:**
+
+| Test | Result |
+|---|---|
+| Start with 2 unpublished rows from step 4 | Published on the first round after startup |
+| Place 3 orders | Published 449-488 ms after creation (the poll interval) |
+| All three brokers stopped, place 2 orders | `POST` still returned `202` in ~5 ms. Rows stayed unpublished |
+| Brokers started again | Both rows published within 4 s |
+| Two instances (ports 8081, 8082), 30 orders spread over both | 30 messages in Kafka, 30 distinct `eventId`s, 0 unpublished |
+| Advisory lock held from `psql` for 5 s, order placed meanwhile | `published_at` stayed `NULL` while the lock was held, set right after release |
+
+**The outage test is the point of the pattern:** Kafka being down did not stop customers from
+placing orders. The events waited safely in the database.
+
+**A bug found and fixed: duplicates after an outage.** The first version waited at most 30 s for
+the batch (`get(30, SECONDS)`), while the producer keeps retrying for `delivery.timeout.ms` (120 s).
+During the outage the relay gave up after 30 s and rolled back, but the records were still in the
+producer's buffer. When Kafka came back, those buffered records were delivered **and** the relay
+sent the rows again:
+
+```
+Offset:41  eventId:fdffe0cc...  customer-201
+Offset:42  eventId:56c11e77...  customer-202
+Offset:43  eventId:fdffe0cc...  customer-201   <- duplicate
+Offset:44  eventId:56c11e77...  customer-202   <- duplicate
+```
+
+Producer idempotence did not help: the relay called `send()` twice, so they are two different records
+to the producer. The fix: no timeout in the relay (`allOf(...).join()`). The producer guarantees every
+send completes, with success or error, within `delivery.timeout.ms`. The same outage test afterwards
+produced exactly one message per event.
+
+**Still at-least-once.** If the relay crashes after Kafka acknowledged a batch but before the
+`published_at` update commits, the batch is sent again. The `eventId` header and payload field let
+consumers detect that. The next step makes the consumer idempotent.
+
+**Other notes:**
+
+- `payload` is `JSONB`, so PostgreSQL normalizes it: key order and spacing in Kafka differ from what
+  Jackson wrote. The content is the same. Use `JSON` or `TEXT` if exact bytes matter (e.g. signatures).
+- During a Kafka outage the relay holds one database connection and transaction open for up to
+  `delivery.timeout.ms`. Fine for one relay, but worth knowing.
+- Polling adds load and up to one poll interval of latency, even when nothing happens.
+  CDC with Debezium (later step) reads the database log instead.
+- Published rows stay in the table. A cleanup job (delete published rows older than N days) is
+  needed in production.
+- `inventory-service` now receives JSON events instead of plain strings.
