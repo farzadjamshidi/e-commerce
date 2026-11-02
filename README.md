@@ -1356,3 +1356,106 @@ offsets, it resends from the last committed position. The inbox handles that.
 - The WAL is shared by all databases on the server. If `order_db` is quiet while `inventory_db` is busy,
   the slot does not move and PostgreSQL keeps more and more WAL. Debezium's `heartbeat.interval.ms` with
   `heartbeat.action.query` (a small write in `order_db`) prevents that. Not set here yet.
+
+#### Step 12: Debezium heartbeat and outbox cleanup
+
+Two fixes for running the outbox on CDC: keep the replication slot moving, and stop keeping outbox rows.
+
+##### Heartbeat: keep the replication slot moving
+
+**Problem, reproduced:** the WAL is shared by all databases on the server, but the slot only moves when
+Debezium confirms a change from `order_db`. 200 WAL messages of 100 kB written in `inventory_db`
+(`pg_logical_emit_message`) left the `order_outbox_slot` **19 MB** behind, and it stayed there.
+A quiet `order_db` next to a busy database means PostgreSQL keeps WAL until the disk is full.
+
+**Fix:** Debezium writes to `order_db` itself on a timer, so there is always a recent change to confirm.
+
+`V4__create_debezium_heartbeat.sql` (order-service): a one-row table `debezium_heartbeat (id, ts)`,
+`UPDATE` granted to `debezium`, and the table added to `outbox_publication`.
+
+Connector additions:
+
+```json
+"table.include.list": "public.outbox_events,public.debezium_heartbeat",
+"heartbeat.interval.ms": "10000",
+"heartbeat.action.query": "UPDATE debezium_heartbeat SET ts = now() WHERE id = 1",
+"transforms.outbox.predicate": "isOutbox",
+"predicates": "isOutbox",
+"predicates.isOutbox.type": "org.apache.kafka.connect.transforms.predicates.TopicNameMatches",
+"predicates.isOutbox.pattern": "order-db\\.public\\.outbox_events"
+```
+
+- The predicate runs the `EventRouter` only on outbox records. Heartbeat table changes have no
+  outbox columns and would fail in the router.
+- Two topics are created by hand (auto-create is off), RF 3, 1 partition, compacted, because only the
+  latest value matters: `__debezium-heartbeat.order-db` (Debezium's own heartbeat records) and
+  `order-db.public.debezium_heartbeat` (the table changes).
+
+**First attempt failed.** I first dropped heartbeat records with the `Filter` SMT, so no extra topics
+were needed. Debezium received the updates (logs showed `messageType=UPDATE`, txId 933 → 947), but
+`connect-offsets` got no new entry and the slot did not move. Kafka Connect does not commit the
+source offset of a record that a transform dropped, so Debezium never confirmed the new LSN to
+PostgreSQL. The heartbeat records must actually be written to Kafka.
+
+**Observed with the fix:** the same 19 MB of noise was released within 90 seconds (680 bytes behind).
+The delay is up to `heartbeat.interval.ms` plus Connect's `offset.flush.interval.ms` (60 s).
+
+**Monitor in production:**
+
+```sql
+SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn))
+FROM pg_replication_slots;
+```
+
+`max_slot_wal_keep_size` is the last line of defence: PostgreSQL invalidates a slot that falls further
+behind, which protects the disk but forces a new snapshot of the connector.
+
+##### Outbox rows deleted in the same transaction
+
+With CDC the event is read from the WAL, not from the table. So `OrderService` deletes the outbox row
+right after inserting it, in the same transaction:
+
+```java
+OutboxEvent outboxEvent = outboxEventRepository.saveAndFlush(OutboxEvent.create(...));
+if (!relayEnabled) {
+    outboxEventRepository.delete(outboxEvent);
+}
+```
+
+- `saveAndFlush`, not `save`, and this was tested. `OutboxEvent` clears its `isNew` flag in
+  `@PostPersist`, which Hibernate fires only when the `INSERT` actually runs (at flush).
+  `SimpleJpaRepository.delete()` returns without doing anything for an entity that reports `isNew()`.
+  With a plain `save`, the SQL log showed the `INSERT` and no `DELETE`, and the row stayed in the table.
+  The event was still published, so nothing broke visibly. Only the cleanup silently failed.
+- The `EventRouter` publishes the insert and ignores the delete (`tombstones.on.delete` is `false`).
+- Only when the polling relay is off. The relay reads the table, so its rows must stay.
+- The table stays empty, so no cleanup job, no table bloat, no index on unpublished rows to maintain.
+
+**Observed:** two orders, `orders` topic offsets went from 159 to 161, inventory reserved both
+(`headphones-z` stock set to 5 by hand for the test), `outbox_events` row count did not change.
+The 62 old rows from the relay era were then deleted once by hand (`DELETE 62`). No messages were
+produced and Connect logged no warnings.
+
+**Trade-off:** the table no longer shows what was sent. The `orders` topic, the Connect offsets and
+Debezium metrics are now the only record. Some teams keep rows for a few days for debugging and
+delete them with a scheduled job instead.
+
+### Phase 2 summary
+
+The order flow is now reliable end to end:
+
+```
+POST /orders ─► order_db: orders + outbox INSERT (+ DELETE) in one transaction ─► 202
+                   │ WAL
+                   ▼
+             Debezium (slot, pgoutput, EventRouter) ─► topic orders (key = orderId)
+                                                          │
+inventory_db: inbox INSERT + stock UPDATE in one transaction ◄─ inventory-service ─► ack
+```
+
+- No dual write: the order and its event commit together.
+- At-least-once delivery from Debezium, effectively-once effect through the inbox.
+- Kafka or Connect outages delay events but do not lose them and do not fail the API.
+
+Pushing order status to clients (SSE) moves to Phase 3. The status only changes once the Saga
+confirms or cancels orders.
