@@ -29,5 +29,6 @@ spring:
 
 outbox:
   relay:
+    enabled: false
     poll-interval-ms: 500
     batch-size: 100

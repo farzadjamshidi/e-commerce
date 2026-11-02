@@ -1283,3 +1283,76 @@ curl -s localhost:8083/connectors          # running connectors
 | `connect-status` | 5 |
 
 - `GET /connectors` returned `[]`. The polling relay still publishes events until the next step.
+
+#### Step 11: Debezium publishes the outbox (polling relay off)
+
+**Relay off:** `OutboxRelay` is now `@ConditionalOnBooleanProperty("outbox.relay.enabled")`, and
+`application.yml` sets `outbox.relay.enabled: false`. The class stays for comparison. Running both
+would publish every event twice. The inbox would absorb that, but it is wasted work.
+
+**Connector:** `infra/debezium/order-outbox-connector.json`, registered with:
+
+```bash
+curl -X PUT localhost:8083/connectors/order-outbox/config \
+  -H 'Content-Type: application/json' -d @infra/debezium/order-outbox-connector.json
+curl -s localhost:8083/connectors/order-outbox/status
+```
+
+`PUT .../config` creates or updates the connector, so it is safe to run again.
+
+| Setting | Value | Why |
+|---|---|---|
+| `database.user` | `debezium` | The least-privilege user from step 9 |
+| `plugin.name` | `pgoutput` | Built into PostgreSQL, respects publications |
+| `publication.name`, `publication.autocreate.mode` | `outbox_publication`, `disabled` | Use the publication from the V3 migration. Debezium must not create its own (it has no rights to) |
+| `slot.name` | `order_outbox_slot` | Fixed name, so it is easy to find and monitor |
+| `snapshot.mode` | `no_data` | All 58 existing rows were already published by the relay. An initial snapshot would send them again |
+| `key.converter`, `value.converter` | `StringConverter` | Key is the order ID, value is the JSON payload as-is, same format as the relay produced |
+| `transforms.outbox.type` | `EventRouter` | Debezium's outbox SMT, described below |
+
+**Outbox Event Router:** without it, Debezium emits a change event per row (`before`, `after`, `op`,
+`source`...) to a topic named after the table (`order-db.public.outbox_events`). Consumers would then
+be coupled to the outbox table layout. The SMT (single message transform) turns each **insert** into the
+domain event itself:
+
+| Router setting | Outbox column | Kafka record |
+|---|---|---|
+| `table.field.event.key` | `aggregate_id` | Key, so all events of one order go to one partition |
+| `table.field.event.payload` | `payload` | Value |
+| `table.field.event.id` | `id` | Header `id` |
+| `table.fields.additional.placement` | `id`, `event_type` | Headers `eventId`, `eventType`, which `inventory-service` already reads |
+| `route.by.field` + `route.topic.replacement` | `aggregate_type` | Topic `orders` |
+
+`route.topic.replacement` is fixed to `orders` because there is only one aggregate type. The replacement
+can use `${routedByValue}` but cannot change `Order` into `orders`. With more aggregates, use
+`outbox.event.${routedByValue}` topic names, or store the topic name in `aggregate_type`.
+
+**Observed:**
+
+- Connector and task `RUNNING`. `pg_replication_slots` shows `order_outbox_slot`, plugin `pgoutput`, active.
+- `order-service` started without the relay (no `OutboxRelay` log lines). `POST /orders` produced:
+
+```
+key:     fd1e75ea-965e-44fc-9a7e-fcb2b511d81c
+headers: __debezium.context.*, id:6578dfec-..., eventId:6578dfec-..., eventType:OrderCreated
+value:   {"sku": "laptop-pro-14", "eventId": "6578dfec-...", "orderId": "fd1e75ea-...", ...}
+```
+
+- `inventory-service` processed it with no code change (insufficient stock, laptop was sold out in step 8).
+- **Connect down:** `docker stop connect`, three orders placed, all `202`. The slot became inactive
+  and kept 32 kB of WAL. After `docker start connect`, all three events reached inventory about 9 seconds
+  later, mostly worker startup time.
+- After the catch-up the slot still showed 39 kB behind. Debezium confirms the LSN to PostgreSQL only
+  when Connect commits its offsets (`offset.flush.interval.ms`, 60 s by default), not after every record.
+
+**Delivery is still at-least-once.** If Connect crashes after sending records but before committing
+offsets, it resends from the last committed position. The inbox handles that.
+
+**Notes:**
+
+- `published_at` stays `NULL` now: Debezium only reads. Because the WAL already carries the event,
+  the outbox row could be deleted in the same transaction right after the insert. The table would then
+  stay empty. That cleanup is not done yet.
+- The WAL is shared by all databases on the server. If `order_db` is quiet while `inventory_db` is busy,
+  the slot does not move and PostgreSQL keeps more and more WAL. Debezium's `heartbeat.interval.ms` with
+  `heartbeat.action.query` (a small write in `order_db`) prevents that. Not set here yet.
