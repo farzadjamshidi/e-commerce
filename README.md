@@ -1459,3 +1459,48 @@ inventory_db: inbox INSERT + stock UPDATE in one transaction ◄─ inventory-se
 
 Pushing order status to clients (SSE) moves to Phase 3. The status only changes once the Saga
 confirms or cancels orders.
+
+### Phase 3: Saga and failures
+
+An order crosses several services, each with its own database. There is no shared transaction, so a
+failure in a later step must be undone by **compensating** earlier steps (release stock, cancel order).
+
+**Two ways to coordinate a Saga:**
+
+| | Choreography | Orchestration |
+|---|---|---|
+| Control | No coordinator. Each service reacts to the others' events | An orchestrator (in `order-service`) sends commands and waits for replies |
+| The flow | Spread across services | Written in one place, one state row per order |
+| Coupling | Low, services only know events | The orchestrator knows every participant |
+| Compensation | Each service decides when to undo | The orchestrator decides explicitly |
+| Debugging "why is this order stuck?" | Needs tracing across services | One table lookup |
+| Good for | Short flows, 2–3 steps | Longer flows, many failure paths |
+
+A concrete problem with choreography here: `payment-service` needs the amount, which
+`InventoryReserved` does not carry. Either inventory adds it (inventory now depends on payment's needs),
+or payment also reads `OrderCreated` and keeps a copy. Those are different topics, and Kafka gives no
+ordering across topics, so `InventoryReserved` can arrive before payment has seen `OrderCreated`.
+With orchestration the `ChargePayment` command simply contains the amount.
+
+**Plan:** build both and compare.
+
+1. Shared parts on `main`: `payment-service`, a reservations table, an outbox in inventory and payment.
+   Every service that publishes needs an outbox, and every service that consumes needs an inbox,
+   whichever style is used.
+2. Branch `saga-choreography` and branch `saga-orchestration` from that point.
+3. Retry topics and DLT on the chosen branch, then merge it to `main` for Phase 4.
+
+#### Step 1: payment-service connected to payment_db
+
+A new Spring Boot service, `payment-service` (package `com.ecommerce.payment`), with the same stack
+as `inventory-service`: Kafka, Jackson, JPA, Flyway, PostgreSQL driver. No web layer.
+
+- `infra/postgres/init.sql`: user `payment_service`, database `payment_db`, `REVOKE CONNECT FROM PUBLIC`.
+  Applied by hand on the existing volume, because `init.sql` only runs on an empty one.
+- `V1__create_processed_events.sql`: the same inbox table as inventory, ready for its first listener.
+- Consumer group `payment-service`, `group.protocol: consumer`, `manual_immediate` acks, the same settings
+  as inventory.
+
+**Observed:** Flyway applied V1 to `payment_db`. Connecting to `payment_db` as `inventory_service`
+fails with `permission denied for database "payment_db"`. The service exits right after startup:
+it has no listener yet, so nothing keeps it running.
