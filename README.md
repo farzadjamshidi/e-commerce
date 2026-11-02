@@ -1504,3 +1504,33 @@ as `inventory-service`: Kafka, Jackson, JPA, Flyway, PostgreSQL driver. No web l
 **Observed:** Flyway applied V1 to `payment_db`. Connecting to `payment_db` as `inventory_service`
 fails with `permission denied for database "payment_db"`. The service exits right after startup:
 it has no listener yet, so nothing keeps it running.
+
+#### Step 2: Reservations per order in inventory
+
+`stock.reserved` was only a total per SKU. To release the stock of one cancelled order (the Saga's
+compensation), inventory must know what each order holds.
+
+`V3__create_reservations.sql`:
+
+| Column | Why |
+|---|---|
+| `order_id UUID PRIMARY KEY` | One reservation per order (one product line per order). A second reservation for the same order fails on the key, a second safety net after the inbox |
+| `sku` → `stock (sku)` | Foreign key inside the same service's database is fine |
+| `quantity` | How much to give back on release |
+| `status` | `RESERVED` now, `RELEASED` after compensation. The row is kept, not deleted, for history |
+
+The handler inserts the row in the same transaction as the inbox row and the stock update, only when the
+conditional `UPDATE stock` succeeded.
+
+**Existing data:** the 15 units reserved before this step had no owning row and could never be released.
+The migration returns them to `available` (`available = available + reserved, reserved = 0`).
+From now on this invariant holds:
+
+```sql
+stock.reserved = SUM(reservations.quantity) WHERE status = 'RESERVED'   -- per SKU
+```
+
+**Observed:** on startup inventory processed two `phone-x` events that had waited in the topic (from the
+`save` vs `saveAndFlush` test), then four new orders: laptop x2 reserved, phone x5 insufficient,
+headphones x1 reserved, `unknown-sku` insufficient (the conditional update matches no row, so the
+foreign key is never reached). Four reservation rows, and `reserved` matched the row sum for every SKU.

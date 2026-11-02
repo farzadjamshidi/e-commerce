@@ -15,16 +15,18 @@ class OrderEventHandler {
 
     private final ProcessedEventRepository processedEventRepository;
     private final StockRepository stockRepository;
+    private final ReservationRepository reservationRepository;
     private final JsonMapper jsonMapper;
 
     OrderEventHandler(ProcessedEventRepository processedEventRepository, StockRepository stockRepository,
-                      JsonMapper jsonMapper) {
+                      ReservationRepository reservationRepository, JsonMapper jsonMapper) {
         this.processedEventRepository = processedEventRepository;
         this.stockRepository = stockRepository;
+        this.reservationRepository = reservationRepository;
         this.jsonMapper = jsonMapper;
     }
 
-    // The inbox row and the stock change commit together, so a redelivered event is skipped
+    // The inbox row, the stock change and the reservation row commit together
     @Transactional
     void handle(UUID eventId, String eventType, String payload) {
         // Checked before the inbox: an ignored type must not be marked processed,
@@ -39,6 +41,7 @@ class OrderEventHandler {
         }
         OrderCreatedEvent event = jsonMapper.readValue(payload, OrderCreatedEvent.class);
         if (stockRepository.reserve(event.sku(), event.quantity()) == 1) {
+            reservationRepository.insertReserved(event.orderId(), event.sku(), event.quantity());
             log.info("Reserved {} x {} for order {}", event.quantity(), event.sku(), event.orderId());
         } else {
             // Recorded as processed anyway: retrying will not create stock. The order is told in Phase 3.
