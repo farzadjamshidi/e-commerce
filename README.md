@@ -1057,3 +1057,42 @@ consumers detect that. The next step makes the consumer idempotent.
 - Published rows stay in the table. A cleanup job (delete published rows older than N days) is
   needed in production.
 - `inventory-service` now receives JSON events instead of plain strings.
+
+#### Step 6: inventory-service connected to inventory_db, with an inbox table
+
+`inventory-service` gets the same database stack as `order-service` (`spring-boot-starter-data-jpa`,
+`spring-boot-starter-flyway`, `flyway-database-postgresql`, `postgresql`) and its own database:
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/inventory_db
+    username: inventory_service
+    password: inventory_service
+  jpa:
+    hibernate:
+      ddl-auto: validate
+```
+
+There is no `open-in-view` setting: the service has no web layer.
+
+**`V1__create_processed_events.sql`** creates the inbox table:
+
+| Column | Type | Why |
+|---|---|---|
+| `event_id` | `UUID PRIMARY KEY` | The `eventId` from the event. The primary key makes "already processed?" a single index lookup, and a second insert of the same ID fails |
+| `event_type` | `VARCHAR(64)` | Useful when debugging which events were handled |
+| `processed_at` | `TIMESTAMPTZ` | When it was handled. Also lets a cleanup job delete old rows later |
+
+**Why an inbox table:** the relay delivers at-least-once, so the same event can arrive twice.
+The consumer will insert the `eventId` into this table **in the same database transaction** as its
+business change. A duplicate then hits the primary key and the business change is not repeated.
+Offsets alone cannot do this: the commit of the offset and the database change are two separate
+systems, so a crash between them always leaves a window for redelivery.
+
+**Observed:** on first start Flyway created `flyway_schema_history` and applied V1. The consumer still
+joined the group and got all three `orders` partitions. Connecting to `inventory_db` as
+`order_service` fails with `permission denied for database "inventory_db"`, so the database-per-service
+boundary holds.
+
+The listener does not use the table yet. That is the next step.

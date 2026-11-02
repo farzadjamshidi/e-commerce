@@ -1,6 +1,13 @@
 spring:
   application:
     name: inventory-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/inventory_db
+    username: inventory_service
+    password: inventory_service
+  jpa:
+    hibernate:
+      ddl-auto: validate
   kafka:
     bootstrap-servers: localhost:19092,localhost:29092,localhost:39092
     consumer:
