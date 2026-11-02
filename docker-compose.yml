@@ -50,6 +50,8 @@ services:
   postgres:
     image: postgres:18.1
     container_name: postgres
+    # Logical decoding lets Debezium read row changes from the WAL
+    command: ["postgres", "-c", "wal_level=logical"]
     ports:
       - "5432:5432"
     environment:

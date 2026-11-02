@@ -1197,3 +1197,46 @@ for that type later and replaying the topic would skip all of them as duplicates
 - `reserved` is a total per SKU. There is no row per order, so a reservation cannot be released for one
   cancelled order yet. That is needed for compensation in Phase 3.
 - Demo stock is seeded by a migration. A real service would get it from a catalog or warehouse feed.
+
+#### Step 9: PostgreSQL ready for CDC (logical replication)
+
+The polling relay will be replaced by Debezium, which reads changes from the PostgreSQL WAL
+(write-ahead log) instead of querying the table. This step only prepares the database.
+
+| Change | Where | Why |
+|---|---|---|
+| `wal_level=logical` | `docker-compose.yml` (`command`) | The default `replica` WAL has only physical page changes. `logical` adds enough to decode row changes |
+| User `debezium` with `REPLICATION`, `CONNECT` on `order_db` | `infra/postgres/init.sql` | A separate least-privilege user for CDC, not the service user |
+| `CREATE PUBLICATION outbox_publication FOR TABLE outbox_events` | order-service `V3__publish_outbox_events.sql` | Debezium's `pgoutput` plugin streams only tables in the publication. `orders` stays private |
+| `GRANT SELECT ON outbox_events TO debezium` | same migration | Needed for the initial snapshot. Nothing else in `order_db` is readable |
+
+The publication and grant live in the order-service migration because the table owner
+(`order_service`) must create them, and only after Flyway has created the table.
+
+`init.sql` runs only when the data volume is empty, so on the existing volume the `debezium` user was
+created by hand with the same SQL. Changing `wal_level` needs a server restart
+(`docker compose up -d postgres` recreated the container, the data volume stayed).
+
+**Observed:** `SHOW wal_level` returns `logical`. As `debezium`: `outbox_events` is readable,
+`orders` returns `permission denied`.
+
+A temporary slot with the `test_decoding` plugin showed what the WAL holds after one `POST /orders`:
+
+```
+918 | BEGIN 918
+918 | table public.orders: INSERT: id[uuid]:'23400a87-...' customer_id:'c-cdc' sku:'phone-x' ...
+918 | table public.outbox_events: INSERT: id[uuid]:'bf79e32e-...' "position":58 aggregate_type:'Order' ...
+918 | COMMIT 918
+919 | BEGIN 919
+919 | table public.outbox_events: UPDATE: ... (the polling relay setting published_at)
+919 | COMMIT 919
+```
+
+- The order and its outbox row are in **one transaction** (xid 918). CDC only sees committed
+  transactions, in commit order.
+- `test_decoding` ignores publications, so `orders` appears here. Debezium uses `pgoutput`, which does
+  respect them.
+
+**Replication slots are dangerous when forgotten.** A slot makes PostgreSQL keep all WAL the consumer
+has not confirmed. A slot nobody reads fills the disk. The demo slot was dropped right away;
+`pg_replication_slots` is empty. In production, monitor slot lag and set `max_slot_wal_keep_size`.
