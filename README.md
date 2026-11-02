@@ -1240,3 +1240,46 @@ A temporary slot with the `test_decoding` plugin showed what the WAL holds after
 **Replication slots are dangerous when forgotten.** A slot makes PostgreSQL keep all WAL the consumer
 has not confirmed. A slot nobody reads fills the disk. The demo slot was dropped right away;
 `pg_replication_slots` is empty. In production, monitor slot lag and set `max_slot_wal_keep_size`.
+
+#### Step 10: Kafka Connect with Debezium (no connector yet)
+
+New `connect` service in `docker-compose.yml`: `quay.io/debezium/connect:3.7.0.Final` (Debezium images
+are published on quay.io, not Docker Hub). REST API on port **8083**.
+
+**Kafka Connect** is a framework that runs inside its own worker processes, separate from the brokers. It moves data
+between Kafka and other systems using **connectors**: a source connector writes into Kafka, a sink
+connector reads from it. You configure connectors with JSON over REST instead of writing a producer.
+Debezium is a set of source connectors (one per database) that run on Connect.
+
+| Setting | Why |
+|---|---|
+| `BOOTSTRAP_SERVERS` | Internal listener names, because Connect runs inside the Docker network |
+| `GROUP_ID: connect-cluster` | Workers with the same group form one Connect cluster and share the work (same group protocol idea as consumers) |
+| `CONFIG_STORAGE_TOPIC`, `OFFSET_STORAGE_TOPIC`, `STATUS_STORAGE_TOPIC` | Connect is stateless itself: connector configs, source offsets (for Debezium: the WAL position) and task status live in Kafka |
+| `*_REPLICATION_FACTOR: 3` | Losing these topics loses the connector state, so they get the same durability as business topics |
+
+Connect creates these topics itself through the admin API, so `auto.create.topics.enable=false` on the
+brokers does not block it.
+
+```bash
+curl -s localhost:8083/                    # worker version and Kafka cluster id
+curl -s localhost:8083/connector-plugins   # installed connector classes
+curl -s localhost:8083/connectors          # running connectors
+```
+
+**Observed:**
+
+- `GET /` returned version `4.3.1` and cluster id `5L6g3nShT-eMCtK--X86sw`, the same id as our cluster.
+  A 4.3 worker talks to 4.1 brokers without problems: clients and brokers negotiate API versions.
+- `io.debezium.connector.postgresql.PostgresConnector` `3.7.0.Final` is installed, along with
+  the other Debezium connectors and MirrorMaker 2.
+- Internal topics, all RF 3, `min.insync.replicas=2`, `cleanup.policy=compact` (only the latest value per
+  key matters):
+
+| Topic | Partitions |
+|---|---|
+| `connect-configs` | 1 (must be 1, configs need a total order) |
+| `connect-offsets` | 25 |
+| `connect-status` | 5 |
+
+- `GET /connectors` returned `[]`. The polling relay still publishes events until the next step.
