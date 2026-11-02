@@ -1151,3 +1151,49 @@ the next start.
   such as an HTTP call or a Kafka send, can still happen twice and needs its own idempotency.
 - The inbox grows with every event. Rows older than the topic retention can be deleted, because
   those events can no longer be redelivered.
+
+#### Step 8: Stock reservation behind the inbox
+
+The inbox now protects real work: `OrderCreated` reserves stock in the same transaction that records
+the `eventId`.
+
+**`V2__create_stock.sql`:** table `stock` (`sku` PK, `available`, `reserved`, both `CHECK >= 0`) with
+three demo SKUs: `laptop-pro-14` (10), `phone-x` (3), `headphones-z` (0).
+
+**Reservation is one conditional update:**
+
+```sql
+UPDATE stock SET available = available - :quantity, reserved = reserved + :quantity, updated_at = now()
+WHERE sku = :sku AND available >= :quantity
+```
+
+1 row means reserved, 0 rows means not enough stock (or unknown SKU). Check and change happen in one
+statement under the row lock, so two concurrent reservations cannot both read "8 left" and both
+subtract. The alternatives are a read-modify-write with optimistic locking (`@Version`, retry on
+conflict) or `SELECT ... FOR UPDATE`. Both need more code and more round trips.
+
+**Event parsing:** `inventory-service` has its own `OrderCreatedEvent` record with only the fields it
+needs (`orderId`, `sku`, `quantity`) and `@JsonIgnoreProperties(ignoreUnknown = true)`. It does not
+share a class with `order-service`. The producer can add fields without breaking this consumer
+("tolerant reader"). `spring-boot-starter-jackson` was added for the `JsonMapper`.
+
+**Insufficient stock** is still recorded in the inbox. Retrying the event will not create stock, so it
+is a business outcome, not a failure. Telling the order about it is the Saga work in Phase 3.
+
+**Event types this service does not handle** are ignored **before** the inbox insert. The inbox means
+"this work was done", not "this message was seen". If ignored events were recorded, adding a handler
+for that type later and replaying the topic would skip all of them as duplicates.
+
+**Observed:**
+
+| Test | Result |
+|---|---|
+| `laptop-pro-14` x2, `phone-x` x5, `headphones-z` x1, `phone-x` x3 | Reserved, insufficient, insufficient, reserved. Stock: laptop 8/2, phone 0/3, headphones 0/0 |
+| Two inventory instances, 12 parallel orders of 1 laptop (8 left) | Instance A reserved 6, instance B reserved 2 and rejected 4. `available` = 0, never negative |
+| Offsets reset to earliest, whole topic replayed | 59 records, 59 duplicates skipped, 0 reservations. Stock unchanged. 57 inbox rows, because 2 of the 59 records were the step 5 relay duplicates |
+
+**Limits:**
+
+- `reserved` is a total per SKU. There is no row per order, so a reservation cannot be released for one
+  cancelled order yet. That is needed for compensation in Phase 3.
+- Demo stock is seeded by a migration. A real service would get it from a catalog or warehouse feed.

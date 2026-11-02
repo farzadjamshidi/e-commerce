@@ -34,7 +34,7 @@ class OrderEventListener {
             // Messages from before the outbox have no eventId and cannot be deduplicated
             log.warn("No eventId header <- partition {} offset {}, skipped", record.partition(), record.offset());
         } else {
-            orderEventHandler.handle(UUID.fromString(eventId), header(record, "eventType"), record.key());
+            orderEventHandler.handle(UUID.fromString(eventId), header(record, "eventType"), record.value());
         }
         // Acknowledged only after the database commit. A crash in between means redelivery, which the inbox absorbs.
         ack.acknowledge();
