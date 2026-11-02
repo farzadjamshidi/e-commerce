@@ -1096,3 +1096,58 @@ joined the group and got all three `orders` partitions. Connecting to `inventory
 boundary holds.
 
 The listener does not use the table yet. That is the next step.
+
+#### Step 7: Idempotent consumer (inbox)
+
+`inventory-service` now records every event it handles in `processed_events`, in the same database
+transaction as the work itself.
+
+| Class | Role |
+|---|---|
+| `OrderEventListener` | Reads the `eventId` and `eventType` headers set by the relay, calls the handler, then acknowledges the offset |
+| `OrderEventHandler` | `@Transactional`: inserts the inbox row, and only if it is new, does the business work (a log line for now; stock reservation comes later) |
+| `ProcessedEventRepository` | `INSERT ... ON CONFLICT (event_id) DO NOTHING`, which returns 1 for a new event and 0 for a duplicate |
+
+```
+poll record ──► BEGIN
+                 INSERT inbox row ── 0 rows ──► duplicate: skip work
+                     │ 1 row
+                 business change
+                COMMIT
+           ──► ack offset
+```
+
+**Why `ON CONFLICT DO NOTHING`, not "check then insert":**
+
+- `existsById` followed by `save` has a race: after a rebalance, an old and a new owner of a partition
+  can both process the same record for a short time. Both see "not processed" and both do the work.
+  The primary key decides atomically.
+- A plain insert that hits the primary key throws, and in PostgreSQL that marks the whole transaction
+  as failed. `ON CONFLICT DO NOTHING` turns the duplicate into a normal result (0 rows).
+
+**Why the ack comes after the commit:** if the service crashes between commit and ack, Kafka
+redelivers the record and the inbox skips it. The opposite order (ack first) can lose the event:
+the offset moves on but the work was never committed.
+
+**Dedup key:** the `eventId` header, so the payload does not need to be parsed just to find it.
+Records without that header (none left in the topic now, older ones were removed by retention) are
+logged and skipped.
+
+**Observed:**
+
+| Test | Result |
+|---|---|
+| Backlog of 42 events | 40 handled, 2 duplicates skipped. Those 2 were the real duplicates created by the relay bug in step 5 (`fdffe0cc...`, `56c11e77...`) |
+| Offsets reset to earliest, whole topic replayed | 0 handled, 42 duplicates skipped, still 40 inbox rows |
+| New order through the API | Handled once, inbox has 41 rows |
+
+On startup the consumer took about 5 seconds after `partitions assigned` to deliver its first record.
+A test that stopped the service after 2 seconds saw nothing. The record was not lost: it was handled on
+the next start.
+
+**Limits:**
+
+- The inbox only protects work inside the same database transaction. A side effect outside it,
+  such as an HTTP call or a Kafka send, can still happen twice and needs its own idempotency.
+- The inbox grows with every event. Rows older than the topic retention can be deleted, because
+  those events can no longer be redelivered.
