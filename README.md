@@ -1931,3 +1931,65 @@ and nobody else waits for it. A real system would notify the customer.
   `REFUNDED`, 73 `CANCELLED`.
 - Both topics replayed from earliest: 8 duplicate `InventoryReserved`, 74 duplicate `OrderCancelled`.
   The fingerprint (md5) of the `payments` table was the same before and after.
+
+#### Choreography summary (branch `saga-choreography`)
+
+**Events and who reacts to them:**
+
+| Topic | Event | Producer | Consumers |
+|---|---|---|---|
+| `orders` | `OrderCreated` | order | inventory (reserve) |
+| `orders` | `OrderCancelled` | order (timeout) | inventory (release), payment (refund or block) |
+| `inventory` | `InventoryReserved` | inventory | payment (charge) |
+| `inventory` | `InventoryRejected` | inventory | order (cancel) |
+| `payments` | `PaymentCompleted` | payment | order (confirm) |
+| `payments` | `PaymentFailed` | payment | inventory (release), order (cancel) |
+
+6 event types, 3 topics. Each service reads the topics of both other services, so 3 services make 6
+subscriptions, a full mesh.
+
+**Where the saga state lives.** In three databases: `orders.status`, `reservations.status`,
+`payments.status`. No single place answers "where is order X now, and why". You need three queries or
+three topics. This is the main operational cost, and the reason for tracing in Phase 4.
+
+**Where the coupling appeared, even without direct calls:**
+
+1. `InventoryReserved` carries `customerId`, `totalAmount`, `currency` only for payment (Choreography 1).
+2. Order-service has to know which events end the saga (`FINAL_STATUS`). That is knowledge of the whole
+   flow, kept in one consumer.
+3. Compensation knowledge is spread. Inventory must know that `PaymentFailed` and `OrderCancelled` both
+   mean "release". Payment must know that `OrderCancelled` means "refund".
+4. A thought test, adding shipping after payment, changes three services:
+   - order waits for `ShipmentScheduled` instead of `PaymentCompleted`
+   - payment refunds on `ShipmentFailed`
+   - inventory releases on `ShipmentFailed`
+
+**Problems found while building it:**
+
+| Problem | Found in | Fix |
+|---|---|---|
+| No order across topics | 1 (design), 4 (seen live) | Carry the data. Make the end depend on one event. |
+| Stuck orders, no owner | 4 | Timeout job in order-service (5) |
+| Timeout is a guess, the saga keeps running | 5 | `OrderCancelled` handled by inventory (6) and payment (7) |
+| Cancel before or after the charge | 7 | One row per order: `INSERT ... ON CONFLICT` |
+| Two listeners of one service race on one order | 7 | The primary key serializes them |
+| A compensation repeated | 3 | Conditional update on status, on top of the inbox |
+
+**The same guards in every service:**
+
+- inbox + outbox in one transaction, ack after commit
+- type check before the inbox
+- business outcomes are events, not exceptions
+- each status change is a conditional SQL update, a small state machine with `WHERE status = ...`
+
+**What went well:** each service is small and owns its decisions. There is no central component to
+deploy, scale or lose. Happy path end to end takes about 1 s. Replaying any topic changed nothing.
+
+**Scenarios to repeat on `saga-orchestration`, so the comparison is fair:**
+
+1. laptop x1 → `CONFIRMED`
+2. phone x5 → `CANCELLED` (no stock)
+3. laptop x2 → `CANCELLED` (payment limit), stock released
+4. a service down → timeout → `CANCELLED`, stock released, no money taken
+5. cancel arriving before the charge, and after it
+6. replay of every topic → no change
