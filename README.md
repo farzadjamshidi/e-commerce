@@ -1620,3 +1620,45 @@ The smoke test (`INSERT` + `DELETE` in one transaction as `payment_service`) arr
 | payment-service | `payment_db` | `payments` | `processed_events` | `payment-outbox` |
 
 This is the branch point. Both Saga styles start from here.
+
+#### Choreography 1: inventory publishes the reservation result (branch `saga-choreography`)
+
+The flow on this branch:
+
+```
+order:     OrderCreated       ─► orders
+inventory: OrderCreated       ─► InventoryReserved | InventoryRejected   ─► inventory
+payment:   InventoryReserved  ─► PaymentCompleted  | PaymentFailed       ─► payments
+inventory: PaymentFailed      ─► release the reservation (compensation)
+order:     PaymentCompleted   ─► CONFIRMED,  InventoryRejected | PaymentFailed ─► CANCELLED
+```
+
+This step is the inventory line. In the same transaction as the inbox row, the stock update and the
+reservation row, `OrderEventHandler` writes one event through `OutboxWriter`:
+
+| Event | When | Payload |
+|---|---|---|
+| `InventoryReserved` | Conditional `UPDATE stock` matched | `orderId`, `sku`, `quantity`, `customerId`, `totalAmount`, `currency` |
+| `InventoryRejected` | No row matched | `orderId`, `sku`, `quantity`, `reason: INSUFFICIENT_STOCK` |
+
+- Key = order ID (`aggregate_id`), so all events of one order are in one partition of `inventory`.
+- `aggregate_type` is `Reservation`. The topic is fixed to `inventory` by the connector.
+- Inventory's `OrderCreatedEvent` record now also reads `customerId`, `totalAmount`, `currency`.
+
+**Decision: `InventoryReserved` carries the amount (event-carried state transfer).** Payment needs the
+amount to charge. The alternative is that payment also consumes `OrderCreated` and keeps its own copy.
+Those events are on two topics, and Kafka does not order across topics, so `InventoryReserved` could
+arrive before payment has seen `OrderCreated`. Payment would have to park one event and wait for the
+other. Carrying the data avoids that, at a cost: inventory now forwards fields it does not use, only
+because payment needs them. Each new need of a later step changes an earlier step. This is the
+choreography coupling the orchestration branch avoids, because its `ChargePayment` command is built by
+the orchestrator.
+
+**Observed:**
+
+- laptop x1 → `InventoryReserved` with `totalAmount: 1499.99`, phone x5 → `InventoryRejected` with
+  `reason: INSUFFICIENT_STOCK`. Both keyed by the order ID. `inventory` topic offsets went from 1 to 3
+  (1 is the step 3 smoke test).
+- Offsets of `inventory-service` reset to earliest, whole `orders` topic replayed: 74 duplicates, 0
+  reservations, `inventory` topic still at 3. Because the event is written in the business transaction,
+  the inbox also stops duplicate outgoing events.
