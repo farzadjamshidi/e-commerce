@@ -1662,3 +1662,45 @@ the orchestrator.
 - Offsets of `inventory-service` reset to earliest, whole `orders` topic replayed: 74 duplicates, 0
   reservations, `inventory` topic still at 3. Because the event is written in the business transaction,
   the inbox also stops duplicate outgoing events.
+
+#### Choreography 2: payment charges the reserved order (branch `saga-choreography`)
+
+This step is the payment line of the flow. Payment-service now consumes the `inventory` topic.
+
+New in payment-service:
+
+- `V3__create_payments.sql`: `payments` table, one row per order (`order_id` is the primary key), with
+  `amount`, `currency`, `status` (`COMPLETED` / `FAILED`) and `reason`.
+- `InventoryEventListener` + `InventoryEventHandler`: the same shape as inventory's consumer. Type check
+  first, then the inbox, then the work, then ack after commit.
+- Its `InventoryReservedEvent` record reads only `orderId`, `customerId`, `totalAmount`, `currency` and
+  ignores the rest (tolerant reader).
+
+In one transaction: inbox row, payment row, outgoing event.
+
+| Event | When | Payload |
+|---|---|---|
+| `PaymentCompleted` | `totalAmount <= payment.max-amount` | `orderId`, `amount`, `currency` |
+| `PaymentFailed` | Over the limit | `orderId`, `amount`, `currency`, `reason: AMOUNT_LIMIT_EXCEEDED` |
+
+- Key = order ID, `aggregate_type` = `Payment`, topic `payments`.
+- There is no real gateway. `payment.max-amount: 2000` is a deterministic rule, so the failure path
+  (and later the compensation) can be triggered on purpose with a large order.
+- `InventoryRejected` is ignored: payment has nothing to do for an order that was never reserved.
+- A failed payment is also stored. The row records that the order was handled, and the
+  `payments.order_id` primary key is a second guard: a second charge for the same order fails with a
+  constraint error even if a new event ID ever arrived for it.
+
+**Why the decline is not an exception.** "Over the limit" is a business outcome. Throwing would roll back
+and redeliver the same message forever. A real gateway timeout would be different: that is a technical
+failure where a retry can help. That case belongs to the retry topics / DLT step.
+
+**Observed:**
+
+- First start, offsets at earliest: smoke test and `InventoryRejected` ignored, step 1's laptop order
+  charged.
+- laptop x1 (1499.99) → `PaymentCompleted`. laptop x2 (2999.98) → both units reserved by inventory, then
+  `PaymentFailed` with `AMOUNT_LIMIT_EXCEEDED`. `payments` topic: smoke test + 3 events.
+- Offsets reset to earliest, `inventory` replayed: 3 duplicates, 2 ignored, 0 new payments, `payments`
+  topic still 4 records. `outbox_events` empty.
+- The 2 laptops of the failed order are still `reserved` in inventory. Releasing them is the next step.
