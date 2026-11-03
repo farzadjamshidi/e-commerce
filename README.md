@@ -1579,7 +1579,7 @@ curl -X PUT localhost:8083/connectors/inventory-outbox/config \
 **Observed:**
 
 - Flyway applied V4. Connector and task `RUNNING`. `pg_replication_slots` shows both slots active.
-- I registered the connector before the two heartbeat topics existed (my topic script failed silently).
+- I registered the connector before the two heartbeat topics existed (my topic script passed the options in one shell variable, which zsh does not split into words, and a `grep` hid the error).
   The task stayed `RUNNING`, and heartbeats started arriving once the topics were created.
 - A smoke test as `inventory_service`, `INSERT` and `DELETE` of one outbox row in one transaction,
   produced on `inventory`:
@@ -1592,3 +1592,31 @@ value:   {"hello": "cdc"}
 
   `outbox_events` stayed empty. The smoke test message stays in the topic until retention removes it,
   so consumers of `inventory` must ignore unknown event types (the inventory handler already does).
+
+#### Step 4: Outbox and Debezium connector for payment
+
+The same setup as inventory (step 3), for `payment_db`:
+
+- `V2__create_outbox_and_heartbeat.sql`: `outbox_events`, `debezium_heartbeat`, `outbox_publication`,
+  grants for `debezium`.
+- `OutboxWriter`, `OutboxEventRepository`, `OutboxEvent`: copies of inventory's classes. Each service owns
+  its code; there is no shared library between services.
+- `infra/debezium/payment-outbox-connector.json`: `payment_db`, `topic.prefix: payment-db`,
+  `slot.name: payment_outbox_slot`, topic `payments`.
+- `init.sql`: `GRANT CONNECT ON DATABASE payment_db TO debezium`.
+- Topics (RF 3): `payments` (3 partitions), `__debezium-heartbeat.payment-db` and
+  `payment-db.public.debezium_heartbeat` (1 partition, compacted).
+
+**Observed:** Flyway applied V2. Three connectors `RUNNING`, three slots active, heartbeats arriving.
+The smoke test (`INSERT` + `DELETE` in one transaction as `payment_service`) arrived on `payments` with key
+`order-test-2` and headers `eventId`, `eventType`. The table stayed empty.
+
+**State of the shared part:**
+
+| Service | Database | Publishes to | Inbox | Connector |
+|---|---|---|---|---|
+| order-service | `order_db` | `orders` | – | `order-outbox` |
+| inventory-service | `inventory_db` | `inventory` | `processed_events` | `inventory-outbox` |
+| payment-service | `payment_db` | `payments` | `processed_events` | `payment-outbox` |
+
+This is the branch point. Both Saga styles start from here.

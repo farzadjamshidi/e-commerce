@@ -15,3 +15,4 @@ GRANT CONNECT ON DATABASE inventory_db TO debezium;
 CREATE USER payment_service WITH PASSWORD 'payment_service';
 CREATE DATABASE payment_db OWNER payment_service;
 REVOKE CONNECT ON DATABASE payment_db FROM PUBLIC;
+GRANT CONNECT ON DATABASE payment_db TO debezium;
