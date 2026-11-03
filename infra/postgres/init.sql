@@ -10,6 +10,7 @@ REVOKE CONNECT ON DATABASE inventory_db FROM PUBLIC;
 -- Debezium reads the WAL of order_db. Table access is granted by order-service's own migration.
 CREATE USER debezium WITH REPLICATION PASSWORD 'debezium';
 GRANT CONNECT ON DATABASE order_db TO debezium;
+GRANT CONNECT ON DATABASE inventory_db TO debezium;
 
 CREATE USER payment_service WITH PASSWORD 'payment_service';
 CREATE DATABASE payment_db OWNER payment_service;

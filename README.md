@@ -1534,3 +1534,61 @@ stock.reserved = SUM(reservations.quantity) WHERE status = 'RESERVED'   -- per S
 `save` vs `saveAndFlush` test), then four new orders: laptop x2 reserved, phone x5 insufficient,
 headphones x1 reserved, `unknown-sku` insufficient (the conditional update matches no row, so the
 foreign key is never reached). Four reservation rows, and `reserved` matched the row sum for every SKU.
+
+#### Step 3: Outbox and Debezium connector for inventory
+
+Inventory will publish Saga results (reserved, rejected, released), so it gets the same CDC outbox as
+order-service. Which events it writes is decided on the Saga branches.
+
+**`V4__create_outbox_and_heartbeat.sql`:**
+
+- `outbox_events` without `position` and `published_at`. Inventory never had a polling relay, so rows
+  are deleted in the same transaction and those columns have no use.
+- `debezium_heartbeat`, the same one-row table as in `order_db`. With two slots on one server, each
+  slot needs its own heartbeat.
+- `outbox_publication` on both tables (publication names are per database, so the same name is fine),
+  and grants for `debezium`.
+
+`init.sql` grants `debezium` `CONNECT` on `inventory_db` (applied by hand on the existing volume).
+
+**`OutboxWriter`:**
+
+```java
+@Transactional(propagation = Propagation.MANDATORY)
+void write(UUID eventId, String aggregateType, String aggregateId, String eventType, Object event)
+```
+
+- `MANDATORY` throws if there is no surrounding transaction. Writing an event outside the business
+  transaction would bring back the dual write problem, so the code refuses it.
+- Native `INSERT` and `DELETE`, no JPA entity lifecycle. This avoids the `isNew`/`delete()` trap from
+  Phase 2 step 12. `OutboxEvent` is mapped only so `ddl-auto: validate` checks the table.
+- Not called yet. The Saga branches call it.
+
+**`infra/debezium/inventory-outbox-connector.json`:** a copy of the order connector with
+`database.dbname: inventory_db`, `topic.prefix: inventory-db`, `slot.name: inventory_outbox_slot`
+(slot names are unique per server), topic `inventory`.
+
+**Topics created by hand** (RF 3): `inventory` (3 partitions, key = order ID), and compacted, 1 partition:
+`__debezium-heartbeat.inventory-db`, `inventory-db.public.debezium_heartbeat`.
+
+```bash
+curl -X PUT localhost:8083/connectors/inventory-outbox/config \
+  -H 'Content-Type: application/json' -d @infra/debezium/inventory-outbox-connector.json
+```
+
+**Observed:**
+
+- Flyway applied V4. Connector and task `RUNNING`. `pg_replication_slots` shows both slots active.
+- I registered the connector before the two heartbeat topics existed (my topic script failed silently).
+  The task stayed `RUNNING`, and heartbeats started arriving once the topics were created.
+- A smoke test as `inventory_service`, `INSERT` and `DELETE` of one outbox row in one transaction,
+  produced on `inventory`:
+
+```
+headers: id:1111...,eventId:1111...,eventType:OutboxSmokeTest
+key:     order-test-1
+value:   {"hello": "cdc"}
+```
+
+  `outbox_events` stayed empty. The smoke test message stays in the topic until retention removes it,
+  so consumers of `inventory` must ignore unknown event types (the inventory handler already does).
