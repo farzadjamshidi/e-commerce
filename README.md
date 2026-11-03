@@ -1847,3 +1847,35 @@ leaves stock locked longer.
 - `orders` topic 175 → 249 (72 + 1 cancel events, 1 created). `outbox_events` empty.
 - `EXPLAIN` showed a Seq Scan: the table has 81 rows, so the planner skips the index. The index is for
   real table sizes, which was not tested here.
+
+#### Choreography 6: inventory releases on `OrderCancelled` (branch `saga-choreography`)
+
+Inventory's `OrderEventHandler` now handles two types from `orders`:
+
+- `OrderCreated`: reserve or reject, as before (moved to `reserve(...)`).
+- `OrderCancelled`: `reservationRepository.release(orderId)`, the same one-statement compensation as for
+  `PaymentFailed`.
+
+**"Cancel before reserve" cannot happen here.** `OrderCancelled` has the same key as `OrderCreated`, so
+both are in one partition, and inventory always reads the cancel after the create. The reservation, if
+there is one, already exists. This needs no code. It follows from the key choice in Phase 2. A cancel
+with no active reservation (rejected order, already released by `PaymentFailed`, or an order from
+before the reservations table) matches nothing, because of `status = 'RESERVED'`, and is logged.
+
+**But inventory may already have said "reserved".** The stuck order from Choreography 5 shows it.
+Inventory was down, so it read `OrderCreated` and `OrderCancelled` one after the other. It reserved,
+published `InventoryReserved`, then released 12 ms later. The `InventoryReserved` is still on the
+`inventory` topic, and payment will charge an order that is already cancelled. Payment reads `inventory`
+and `orders`, two topics, so for payment the cancel can arrive before or after the reservation. That is
+the next step.
+
+**Observed:**
+
+- On start, inventory caught up 74 `orders` messages:
+  - 5 cancels released a reservation.
+  - 68 had nothing to release (orders from before the reservations table).
+  - The stuck order was reserved and then released.
+- Stock went from headphones 4/1, laptop 5/5, phone 1/2 to 5/0, 7/3, 3/0. The only active reservations
+  are the 3 `CONFIRMED` laptop orders. `stock.reserved = SUM(RESERVED rows)` holds.
+- Offsets reset, `orders` replayed: 81 duplicate `OrderCreated`, 73 duplicate `OrderCancelled`, stock
+  unchanged.

@@ -35,7 +35,7 @@ class OrderEventHandler {
     void handle(UUID eventId, String eventType, String payload) {
         // Checked before the inbox: an ignored type must not be marked processed,
         // or it would be skipped as a duplicate once this service starts handling it
-        if (!OrderCreatedEvent.TYPE.equals(eventType)) {
+        if (!OrderCreatedEvent.TYPE.equals(eventType) && !OrderCancelledEvent.TYPE.equals(eventType)) {
             log.info("Ignored {} {}", eventType, eventId);
             return;
         }
@@ -43,7 +43,14 @@ class OrderEventHandler {
             log.info("Duplicate {} {}, skipped", eventType, eventId);
             return;
         }
-        OrderCreatedEvent event = jsonMapper.readValue(payload, OrderCreatedEvent.class);
+        if (OrderCreatedEvent.TYPE.equals(eventType)) {
+            reserve(jsonMapper.readValue(payload, OrderCreatedEvent.class));
+        } else {
+            release(jsonMapper.readValue(payload, OrderCancelledEvent.class));
+        }
+    }
+
+    private void reserve(OrderCreatedEvent event) {
         if (stockRepository.reserve(event.sku(), event.quantity()) == 1) {
             reservationRepository.insertReserved(event.orderId(), event.sku(), event.quantity());
             InventoryReservedEvent reserved = InventoryReservedEvent.from(event);
@@ -56,6 +63,15 @@ class OrderEventHandler {
             outboxWriter.write(rejected.eventId(), AGGREGATE_TYPE, event.orderId().toString(), rejected.eventType(),
                     rejected);
             log.warn("Insufficient stock for {} x {}, order {}", event.quantity(), event.sku(), event.orderId());
+        }
+    }
+
+    // OrderCancelled has the same key as OrderCreated, so it always comes after it: the reservation, if any, exists
+    private void release(OrderCancelledEvent event) {
+        if (reservationRepository.release(event.orderId()) == 1) {
+            log.info("Released reservation of cancelled order {} ({})", event.orderId(), event.reason());
+        } else {
+            log.info("Cancelled order {} has no active reservation", event.orderId());
         }
     }
 }
