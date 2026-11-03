@@ -1704,3 +1704,56 @@ failure where a retry can help. That case belongs to the retry topics / DLT step
 - Offsets reset to earliest, `inventory` replayed: 3 duplicates, 2 ignored, 0 new payments, `payments`
   topic still 4 records. `outbox_events` empty.
 - The 2 laptops of the failed order are still `reserved` in inventory. Releasing them is the next step.
+
+#### Choreography 3: inventory releases the reservation on `PaymentFailed` (branch `saga-choreography`)
+
+This is the compensation line of the flow. Inventory now has a second listener, on the `payments` topic,
+in the same consumer group `inventory-service`.
+
+- `PaymentEventListener` + `PaymentEventHandler`: the same shape as the other consumers. Only
+  `PaymentFailed` is handled. `PaymentCompleted` and other types are ignored.
+- The inbox (`processed_events`) is shared by both listeners. Event IDs are UUIDs, so they do not clash.
+- `ReservationRepository.release(orderId)` does the whole compensation in one statement:
+
+```sql
+WITH released AS (
+    UPDATE reservations SET status = 'RELEASED', updated_at = now()
+    WHERE order_id = :orderId AND status = 'RESERVED'
+    RETURNING sku, quantity)
+UPDATE stock s SET available = s.available + r.quantity, reserved = s.reserved - r.quantity, updated_at = now()
+FROM released r WHERE s.sku = r.sku
+```
+
+**Why one statement.** The reservation row and the stock counters change together. The quantity comes
+from the reservation row, not from the event, so inventory gives back exactly what it took. `PaymentFailed`
+does not need to carry `sku` or `quantity`.
+
+**Two guards against a double release:**
+
+1. The inbox: the same `PaymentFailed` event is skipped as a duplicate.
+2. `status = 'RESERVED'` in the `WHERE`: even without the inbox row, a reservation that is already
+   `RELEASED` matches nothing, so the stock is not given back twice. A compensation must be idempotent
+   on its own, because it can be triggered more than once and, in a real system, by more than one path
+   (a timeout, a manual cancel).
+
+`release` returning 0 is logged as a warning and not thrown. "Nothing to release" is either a repeat or a
+`PaymentFailed` for an order inventory never reserved. Retrying will not change it.
+
+No event is published after the release. In this flow nobody waits for it: order-service cancels the
+order on `PaymentFailed` itself. An `InventoryReleased` event would be needed only if something had to
+know that the stock is back.
+
+**Not done yet:** on `PaymentCompleted` the reservation stays `RESERVED`. In a real shop it would become
+sold (for example `reserved -= q` and the status set to `COMMITTED`). That is left out, because it does
+not change the Saga.
+
+**Observed:**
+
+- On start, the existing `PaymentFailed` from Choreography 2 released 2 laptops: `laptop-pro-14` went
+  from available 4 / reserved 6 to 6 / 4. The invariant `stock.reserved = SUM(RESERVED rows)` held for
+  all SKUs.
+- Live, all three services running, laptop x2 (2999.98): reserved, then `PaymentFailed`, then released,
+  in about 1.1 s. Stock 6 / 4 before and after. Reservation `RELEASED`.
+- Replay of `payments` (offsets to earliest): 2 duplicates, 3 ignored, stock unchanged.
+- Replay again after deleting the inbox rows for `PaymentFailed`: 2 times "No active reservation", stock
+  still 6 / 4. The second guard works without the first.
