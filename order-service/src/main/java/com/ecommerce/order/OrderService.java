@@ -1,6 +1,7 @@
 package com.ecommerce.order;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -33,19 +34,33 @@ class OrderService {
         Order order = orderRepository.save(Order.place(customerId, sku, quantity, unitPrice, currency));
 
         OrderCreatedEvent event = OrderCreatedEvent.from(order);
+        writeOutbox(event.eventId(), order.getId(), event.eventType(), event, event.occurredAt());
+        return order;
+    }
+
+    // The status change and its event are committed together.
+    // Returns false if the order is no longer PENDING: a saga result or another instance came first.
+    @Transactional
+    boolean cancelIfPending(UUID orderId, String reason) {
+        if (orderRepository.completePending(orderId, OrderStatus.CANCELLED.name()) == 0) {
+            return false;
+        }
+        OrderCancelledEvent event = OrderCancelledEvent.of(orderId, reason);
+        writeOutbox(event.eventId(), orderId, event.eventType(), event, event.occurredAt());
+        return true;
+    }
+
+    private void writeOutbox(UUID eventId, UUID orderId, String eventType, Object event, Instant occurredAt) {
         // Flush runs the INSERT now, which fires @PostPersist and clears isNew.
         // With a plain save, delete() would see a "new" entity and silently do nothing.
-        OutboxEvent outboxEvent = outboxEventRepository.saveAndFlush(OutboxEvent.create(event.eventId(),
-                AGGREGATE_TYPE, order.getId().toString(), event.eventType(), jsonMapper.writeValueAsString(event),
-                event.occurredAt()));
+        OutboxEvent outboxEvent = outboxEventRepository.saveAndFlush(OutboxEvent.create(eventId, AGGREGATE_TYPE,
+                orderId.toString(), eventType, jsonMapper.writeValueAsString(event), occurredAt));
 
         // Debezium reads the INSERT from the WAL, so the row itself is no longer needed.
         // The polling relay reads the table, so the row must stay while it is in use.
         if (!relayEnabled) {
             outboxEventRepository.delete(outboxEvent);
         }
-
-        return order;
     }
 
     @Transactional(readOnly = true)

@@ -41,3 +41,10 @@ outbox:
     enabled: false
     poll-interval-ms: 500
     batch-size: 100
+
+order:
+  pending-timeout:
+    # A healthy saga ends in about a second; an order still PENDING after this is treated as stuck
+    after: 30s
+    check-interval-ms: 5000
+    batch-size: 100

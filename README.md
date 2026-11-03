@@ -1806,3 +1806,44 @@ it published any result, so no final event will ever come. In choreography no si
 saga, so nobody notices a stuck order. The usual fix is a timeout: a job that cancels orders that have been
 `PENDING` too long, and inventory then releases on `OrderCancelled`. In orchestration the orchestrator
 holds the saga state, so the timeout has an obvious owner. This goes into the comparison.
+
+#### Choreography 5: timeout for stuck orders (branch `saga-choreography`)
+
+Choreography 4 left 72 orders `PENDING` forever. No service owns the saga, so nobody noticed. Order-service
+now owns the end of its own orders.
+
+- `PendingOrderTimeout`, a `@Scheduled` job (every 5 s), finds orders `PENDING` longer than
+  `order.pending-timeout.after` (30 s, a healthy saga takes about 1 s), up to 100 per run.
+- `OrderService.cancelIfPending` uses the same `completePending` conditional update. If it moved the order,
+  it writes `OrderCancelled { orderId, reason: TIMEOUT }` to the outbox in the same transaction. The
+  outbox code from `placeOrder` was extracted to `writeOutbox`, so both use it.
+- One transaction per order, so one failure does not undo the others.
+- `V6__index_pending_orders.sql`: a partial index `ON orders (created_at) WHERE status = 'PENDING'`. Only
+  orders still in flight are in it, so it stays small however many orders are finished.
+
+**Why no lock.** The timeout and a late saga result can race on the same order, and so can two instances of
+order-service. `WHERE status = 'PENDING'` decides the winner. The loser updates 0 rows and publishes
+nothing. This was not tested with two instances.
+
+**`OrderCancelled` goes to `orders`, keyed by the order ID.** It is in the same partition as that order's
+`OrderCreated`, so inventory always sees the two in this order. This matters for the next step.
+
+**The race this creates.** Timeout is a guess: "no answer yet" does not mean "it failed". If inventory or
+payment is only slow, the order is cancelled, but the saga keeps going. Stock stays reserved, and payment
+may still charge. `PaymentCompleted` then arrives for a `CANCELLED` order and is ignored: the customer is
+charged for a cancelled order. So `OrderCancelled` must be handled downstream:
+
+- inventory releases the reservation (and must not reserve it if `OrderCancelled` came first)
+- payment refunds if it already charged, or refuses to charge
+
+These are the next steps. The 30 s value is a trade-off: shorter cancels slow but healthy orders, longer
+leaves stock locked longer.
+
+**Observed** (only order-service running, so inventory has not seen the events yet):
+
+- On start, migration V6 applied. The first run cancelled 72 of 72 old `PENDING` orders.
+- A new order placed with inventory down: `PENDING` after 20 s, `CANCELLED` after 40 s. The topic has its
+  `OrderCreated` and then its `OrderCancelled { reason: TIMEOUT }`, same key.
+- `orders` topic 175 → 249 (72 + 1 cancel events, 1 created). `outbox_events` empty.
+- `EXPLAIN` showed a Seq Scan: the table has 81 rows, so the planner skips the index. The index is for
+  real table sizes, which was not tested here.

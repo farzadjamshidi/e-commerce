@@ -1,5 +1,7 @@
 package com.ecommerce.order;
 
+import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -15,4 +17,9 @@ interface OrderRepository extends JpaRepository<Order, UUID> {
             UPDATE orders SET status = :status, version = version + 1, updated_at = now()
             WHERE id = :id AND status = 'PENDING'""", nativeQuery = true)
     int completePending(UUID id, String status);
+
+    @Query(value = """
+            SELECT id FROM orders WHERE status = 'PENDING' AND created_at < :before
+            ORDER BY created_at LIMIT :limit""", nativeQuery = true)
+    List<UUID> findPendingCreatedBefore(Instant before, int limit);
 }
