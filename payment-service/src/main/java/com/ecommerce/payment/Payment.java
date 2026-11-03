@@ -18,13 +18,10 @@ class Payment {
     @Id
     private UUID orderId;
 
-    @Column(nullable = false)
     private String customerId;
 
-    @Column(nullable = false)
     private BigDecimal amount;
 
-    @Column(nullable = false)
     private String currency;
 
     @Enumerated(EnumType.STRING)
@@ -35,6 +32,9 @@ class Payment {
 
     @Column(nullable = false, insertable = false, updatable = false)
     private Instant createdAt;
+
+    @Column(nullable = false, insertable = false, updatable = false)
+    private Instant updatedAt;
 
     protected Payment() {
     }

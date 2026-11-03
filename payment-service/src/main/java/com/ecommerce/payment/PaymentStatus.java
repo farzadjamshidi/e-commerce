@@ -2,5 +2,9 @@ package com.ecommerce.payment;
 
 enum PaymentStatus {
     COMPLETED,
-    FAILED
+    FAILED,
+    // Charged, then the order was cancelled
+    REFUNDED,
+    // The order was cancelled before any charge
+    CANCELLED
 }

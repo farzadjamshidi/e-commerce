@@ -48,18 +48,29 @@ class InventoryEventHandler {
         String orderId = reserved.orderId().toString();
         // Simulated gateway: a deterministic rule makes the failure path easy to trigger
         if (reserved.totalAmount().compareTo(maxAmount) <= 0) {
-            paymentRepository.insert(reserved.orderId(), reserved.customerId(), reserved.totalAmount(),
-                    reserved.currency(), PaymentStatus.COMPLETED.name(), null);
+            if (paymentRepository.insertIfAbsent(reserved.orderId(), reserved.customerId(), reserved.totalAmount(),
+                    reserved.currency(), PaymentStatus.COMPLETED.name(), null) == 0) {
+                skipExisting(orderId);
+                return;
+            }
             PaymentCompletedEvent completed = PaymentCompletedEvent.from(reserved);
             outboxWriter.write(completed.eventId(), AGGREGATE_TYPE, orderId, completed.eventType(), completed);
             log.info("Charged {} {} for order {}", reserved.totalAmount(), reserved.currency(), orderId);
         } else {
             PaymentFailedEvent failed = PaymentFailedEvent.amountLimitExceeded(reserved);
-            paymentRepository.insert(reserved.orderId(), reserved.customerId(), reserved.totalAmount(),
-                    reserved.currency(), PaymentStatus.FAILED.name(), failed.reason());
+            if (paymentRepository.insertIfAbsent(reserved.orderId(), reserved.customerId(), reserved.totalAmount(),
+                    reserved.currency(), PaymentStatus.FAILED.name(), failed.reason()) == 0) {
+                skipExisting(orderId);
+                return;
+            }
             outboxWriter.write(failed.eventId(), AGGREGATE_TYPE, orderId, failed.eventType(), failed);
             log.warn("Payment failed for order {}: {} {} over limit {}", orderId, reserved.totalAmount(),
                     reserved.currency(), maxAmount);
         }
+    }
+
+    // The row is written before the charge, so an order cancelled first is never charged
+    private static void skipExisting(String orderId) {
+        log.warn("Order {} already has a payment row (cancelled or handled), not charged", orderId);
     }
 }

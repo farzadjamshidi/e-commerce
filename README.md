@@ -1879,3 +1879,55 @@ the next step.
   are the 3 `CONFIRMED` laptop orders. `stock.reserved = SUM(RESERVED rows)` holds.
 - Offsets reset, `orders` replayed: 81 duplicate `OrderCreated`, 73 duplicate `OrderCancelled`, stock
   unchanged.
+
+#### Choreography 7: payment handles `OrderCancelled` (branch `saga-choreography`)
+
+Payment reads `inventory` and `orders`, two topics, so for payment the cancel can come before or after
+`InventoryReserved` of the same order. Both orders of arrival must end with no money taken.
+
+- `OrderEventListener` + `OrderEventHandler` on `orders`: only `OrderCancelled` is handled.
+- `V4__allow_cancel_before_charge.sql`: `customer_id`, `amount` and `currency` may be null, but only for
+  status `CANCELLED` (a `CHECK` constraint). Also adds `updated_at`. Two new statuses: `REFUNDED`
+  (charged, then cancelled) and `CANCELLED` (cancelled before any charge).
+- `PaymentRepository.cancel` handles both cases in one statement:
+
+```sql
+INSERT INTO payments (order_id, status, reason) VALUES (:orderId, 'CANCELLED', :reason)
+ON CONFLICT (order_id) DO UPDATE SET status = 'REFUNDED', reason = :reason, updated_at = now()
+WHERE payments.status = 'COMPLETED'
+RETURNING status
+```
+
+| Row before the cancel | Result |
+|---|---|
+| none | insert `CANCELLED`: a marker that blocks the later charge |
+| `COMPLETED` | `REFUNDED` |
+| `FAILED`, `REFUNDED`, `CANCELLED` | no change, no row returned |
+
+- The charge now uses `insertIfAbsent` (`ON CONFLICT DO NOTHING`). 0 means the order already has a row,
+  so the order is not charged and no event is published.
+
+**Why one table and the primary key.** The two listeners have their own consumer threads, so
+`InventoryReserved` and `OrderCancelled` of one order can run at the same time, in two transactions.
+Both write the same `payments.order_id`. The second `INSERT ... ON CONFLICT` waits for the first to commit,
+then sees its row. The database serializes the race. A separate `cancelled_orders` table would leave a
+gap: each transaction would check the other table before the other one committed.
+
+The concurrent case was not forced in a test. Only the two orders of arrival, one after the other, were
+tested.
+
+**Not modeled:** a real refund is a call to the gateway, which can fail and needs its own retry. Here it
+is only a status change. No `PaymentRefunded` event is published. Order-service is already `CANCELLED`,
+and nobody else waits for it. A real system would notify the customer.
+
+**Observed:**
+
+- Charge first: the stuck order from Choreography 5 (`InventoryReserved` waiting on `inventory`) was
+  charged 99.00, and 1.7 s later its `OrderCancelled` turned the row into `REFUNDED`.
+- Cancel first: a test `OrderCancelled` written to `orders` by hand, and 3 s later an `InventoryReserved`
+  for the same order on `inventory`. Result: a `CANCELLED` row with amount null, then "already has a
+  payment row, not charged". `payments` topic unchanged (8 records).
+- The 72 old cancelled orders got a `CANCELLED` row each. Final table: 3 `COMPLETED`, 3 `FAILED`, 1
+  `REFUNDED`, 73 `CANCELLED`.
+- Both topics replayed from earliest: 8 duplicate `InventoryReserved`, 74 duplicate `OrderCancelled`.
+  The fingerprint (md5) of the `payments` table was the same before and after.
