@@ -1757,3 +1757,52 @@ not change the Saga.
 - Replay of `payments` (offsets to earliest): 2 duplicates, 3 ignored, stock unchanged.
 - Replay again after deleting the inbox rows for `PaymentFailed`: 2 times "No active reservation", stock
   still 6 / 4. The second guard works without the first.
+
+#### Choreography 4: order-service ends the saga (branch `saga-choreography`)
+
+This is the last line of the flow. Order-service, until now only a producer, also consumes.
+
+- `V5__create_processed_events.sql`: the inbox, the same table as in the other services.
+- A consumer config in `application.yml`: group `order-service`, `group.protocol: consumer`,
+  `manual_immediate` acks.
+- One `SagaEventListener` on both `inventory` and `payments`. `SagaEventHandler` maps the event type to
+  the final status:
+
+| Event | Order status |
+|---|---|
+| `PaymentCompleted` | `CONFIRMED` |
+| `InventoryRejected` | `CANCELLED` |
+| `PaymentFailed` | `CANCELLED` |
+| `InventoryReserved`, others | ignored (a middle step, not an end) |
+
+- `OrderRepository.completePending` is a conditional update:
+  `UPDATE orders SET status = :status, version = version + 1 ... WHERE id = :id AND status = 'PENDING'`.
+  This is a tiny state machine in SQL: only `PENDING` can move, so a final status is never overwritten. It
+  is the same second-guard idea as the reservation release. The `version` is bumped by hand, because a
+  native update bypasses JPA's `@Version`.
+- `SagaResultEvent(orderId, reason)` is one tolerant record for all three events. Order-service needs only
+  these two fields.
+
+**Cross-topic order, seen live.** On the first start, both topics were read from the beginning. The
+consumer handled `PaymentCompleted` from `payments` before `InventoryReserved` of the same order from
+`inventory`. Kafka orders only inside a partition. The design does not care: the final status depends
+on one event only, and the middle event is ignored. If order-service had to see `InventoryReserved`
+first (for example to set a `RESERVED` status), it would need to accept the events in any order.
+
+**Observed:**
+
+- First start over the existing history: 2 orders `CONFIRMED`, 3 `CANCELLED` (2 `PaymentFailed`, 1
+  `InventoryRejected`), each with `version` 1.
+- Live, all four parts running:
+  - laptop x1 → `CONFIRMED`
+  - laptop x2 → `CANCELLED`, stock released
+  - phone x5 → `CANCELLED`, never reserved
+
+  Laptop stock 6 / 4 → 5 / 5: only the confirmed order still holds stock.
+- Offsets of both topics reset to earliest: 8 duplicates, 8 ignored, no status or version changed.
+
+**Open: orders that never finish.** 72 orders from Phase 2 stay `PENDING`. Inventory handled them before
+it published any result, so no final event will ever come. In choreography no single service owns the
+saga, so nobody notices a stuck order. The usual fix is a timeout: a job that cancels orders that have been
+`PENDING` too long, and inventory then releases on `OrderCancelled`. In orchestration the orchestrator
+holds the saga state, so the timeout has an obvious owner. This goes into the comparison.
