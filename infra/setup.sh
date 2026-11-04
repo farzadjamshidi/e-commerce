@@ -23,7 +23,7 @@ topics() {
     sleep 2
   done
 
-  for topic in orders inventory payments; do
+  for topic in orders inventory payments inventory-commands payment-commands; do
     create_topic "$topic" 3
   done
 

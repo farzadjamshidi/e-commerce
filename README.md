@@ -1647,3 +1647,54 @@ publication is created by that service's own migration. Run this whenever you sw
 **Observed:** containers and volume removed. 13 topics after `setup.sh topics` (3 business, 6
 heartbeat, 4 internal). Migrations order v4, inventory v4, payment v2. 3 connectors `RUNNING`, 3 slots
 active. A test order was reserved by inventory, as on `main`.
+
+#### Orchestration 1: one outbox, several topics (branch `saga-orchestration`)
+
+The orchestrator sends commands to other services, so order-service must now write to more than one
+topic. Commands get their own topics:
+
+| Topic | Direction | Content |
+|---|---|---|
+| `orders` | order → anyone | events about orders |
+| `inventory-commands` | orchestrator → inventory | `ReserveStock`, `ReleaseStock` |
+| `payment-commands` | orchestrator → payment | `ChargePayment` |
+| `inventory`, `payments` | service → orchestrator | replies |
+
+**Why separate command topics.** An event says "this happened" and the producer does not care who reads
+it. A command says "do this" and has exactly one receiver. Separate topics keep that visible, and they
+let the two be sized and secured differently.
+
+Changes:
+
+- `V5__add_outbox_destination.sql`: `outbox_events.destination`. The default only fills existing rows and
+  is then dropped, so every new write must choose a topic.
+- Connector: `route.by.field: destination`, `route.topic.replacement: ${routedByValue}`. The topic now
+  comes from the row. It was fixed to `orders` before.
+- `OutboxEvent.create` takes the destination. `OutboxRelay` reads it too, so its aggregate-to-topic map is gone.
+- `infra/setup.sh topics` also creates the two command topics (3 partitions, RF 3).
+
+**Why a new column and not `aggregate_type`.** Routing by `aggregate_type` would work only if its value
+were the topic name. But a `ReserveStock` command is about an `Order` and goes to `inventory-commands`.
+The two values answer different questions.
+
+**Deployment order matters.** The migration must run before the new connector config. The other way
+round, the router looks for a column that does not exist yet.
+
+**Risk: a wrong destination.** Topic auto-creation is off. A row with an unknown topic would likely fail the
+connector task, and that stops every later event of this database, not just the bad one. Not tested. The
+destinations are constants in the code for this reason.
+
+**Observed:**
+
+- Migration v5 applied, connector config updated with `PUT`, task `RUNNING`.
+- A real order → `OrderCreated` on `orders`, as before.
+- Two test rows (inserted and deleted in one transaction): one arrived on `inventory-commands`, one on
+  `payment-commands`, each with its `aggregate_id` as the key. `outbox_events` empty. The two
+  `OutboxSmokeTest` records stay on the command topics, so their consumers must ignore unknown types.
+
+**Observed by accident: CDC delivers at least once.** `orders` already had 2 records for 1 order, with the
+same `eventId`. The first was written when the order was placed. The second was written 15 s after Connect
+came back from a Docker restart: Connect resumed from its last stored offset and read the same WAL
+entry again. Why the stored offset was behind that entry was not investigated. This is why the inbox
+exists: the outbox gives at-least-once delivery, and only the consumer's deduplication makes it
+effectively once.

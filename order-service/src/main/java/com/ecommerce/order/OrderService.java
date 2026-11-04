@@ -12,6 +12,7 @@ import tools.jackson.databind.json.JsonMapper;
 @Service
 class OrderService {
 
+    private static final String ORDERS_TOPIC = "orders";
     private static final String AGGREGATE_TYPE = "Order";
 
     private final OrderRepository orderRepository;
@@ -36,8 +37,8 @@ class OrderService {
         // Flush runs the INSERT now, which fires @PostPersist and clears isNew.
         // With a plain save, delete() would see a "new" entity and silently do nothing.
         OutboxEvent outboxEvent = outboxEventRepository.saveAndFlush(OutboxEvent.create(event.eventId(),
-                AGGREGATE_TYPE, order.getId().toString(), event.eventType(), jsonMapper.writeValueAsString(event),
-                event.occurredAt()));
+                ORDERS_TOPIC, AGGREGATE_TYPE, order.getId().toString(), event.eventType(),
+                jsonMapper.writeValueAsString(event), event.occurredAt()));
 
         // Debezium reads the INSERT from the WAL, so the row itself is no longer needed.
         // The polling relay reads the table, so the row must stay while it is in use.

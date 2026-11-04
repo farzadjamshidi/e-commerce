@@ -3,7 +3,6 @@ package com.ecommerce.order;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -25,8 +24,6 @@ class OutboxRelay {
 
     private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
     private static final long RELAY_LOCK_KEY = 4_242_001L;
-    private static final Map<String, String> TOPIC_BY_AGGREGATE = Map.of("Order", "orders");
-
     private final OutboxEventRepository outboxEventRepository;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final int batchSize;
@@ -65,12 +62,8 @@ class OutboxRelay {
     }
 
     private static ProducerRecord<String, String> toRecord(OutboxEvent event) {
-        String topic = TOPIC_BY_AGGREGATE.get(event.getAggregateType());
-        if (topic == null) {
-            throw new IllegalStateException("No topic for aggregate type " + event.getAggregateType());
-        }
         ProducerRecord<String, String> record =
-                new ProducerRecord<>(topic, event.getAggregateId(), event.getPayload());
+                new ProducerRecord<>(event.getDestination(), event.getAggregateId(), event.getPayload());
         record.headers().add("eventId", event.getId().toString().getBytes(StandardCharsets.UTF_8));
         record.headers().add("eventType", event.getEventType().getBytes(StandardCharsets.UTF_8));
         return record;
