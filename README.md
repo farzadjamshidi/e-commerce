@@ -1620,3 +1620,30 @@ The smoke test (`INSERT` + `DELETE` in one transaction as `payment_service`) arr
 | payment-service | `payment_db` | `payments` | `processed_events` | `payment-outbox` |
 
 This is the branch point. Both Saga styles start from here.
+
+#### Orchestration 0: a fresh environment per branch (branch `saga-orchestration`)
+
+Both saga branches use the same Postgres and Kafka, but their schemas grow apart. Choreography had
+already applied order `V5`/`V6` and payment `V3`/`V4`. A different `V5` on this branch would fail
+Flyway's checksum check. The data of one branch would also blur the comparison. So each branch starts
+from an empty environment.
+
+The Kafka containers have no volume: topics, offsets and connector configs live in the containers. The
+Postgres data lives in the `postgres-data` volume. `docker compose down -v` removes both.
+
+`infra/setup.sh` rebuilds what used to be typed by hand. It is safe to run again: `--if-not-exists` for
+topics, and `PUT` for connectors.
+
+```bash
+docker compose down -v && docker compose up -d
+infra/setup.sh topics        # orders, inventory, payments + Debezium heartbeat topics
+# start each service once: Flyway creates the tables and the publications
+infra/setup.sh connectors    # fails if a publication does not exist yet
+```
+
+The connectors come after the services because `publication.autocreate.mode` is `disabled`. Each
+publication is created by that service's own migration. Run this whenever you switch saga branch.
+
+**Observed:** containers and volume removed. 13 topics after `setup.sh topics` (3 business, 6
+heartbeat, 4 internal). Migrations order v4, inventory v4, payment v2. 3 connectors `RUNNING`, 3 slots
+active. A test order was reserved by inventory, as on `main`.
