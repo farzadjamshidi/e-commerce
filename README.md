@@ -1698,3 +1698,36 @@ came back from a Docker restart: Connect resumed from its last stored offset and
 entry again. Why the stored offset was behind that entry was not investigated. This is why the inbox
 exists: the outbox gives at-least-once delivery, and only the consumer's deduplication makes it
 effectively once.
+
+#### Orchestration 2: the saga starts with `placeOrder` (branch `saga-orchestration`)
+
+The orchestrator lives inside order-service. The order is what the saga is about, so the saga state and
+the order status share one database and one transaction, and there is no extra service to deploy. A
+larger system might use a separate service or an engine such as Temporal or Camunda.
+
+- `V6__create_order_sagas.sql`: `order_sagas`, one row per order, with the step the saga is waiting for.
+  This is the orchestrator's memory. In choreography this knowledge was spread over three databases.
+- `OrderSagaOrchestrator.start(order)`: writes the saga row in state `RESERVING_STOCK` and the
+  `ReserveStock` command. `Propagation.MANDATORY`, so it can only join `placeOrder`'s transaction.
+- `ReserveStockCommand`: `orderId`, `sku`, `quantity`. Key = order ID, topic `inventory-commands`.
+- `OutboxWriter`: extracted from `OrderService`, because two classes now write to the outbox. Inventory
+  and payment already had one.
+
+One transaction now holds the order row, `OrderCreated`, the saga row and `ReserveStock`.
+
+**`ReserveStock` carries no amount.** In choreography, `InventoryReserved` carried `customerId`,
+`totalAmount` and `currency` only for payment. Here the orchestrator owns the order data and will build
+`ChargePayment` itself. Inventory receives only what inventory needs.
+
+**`OrderCreated` stays.** It is a fact about the order and costs little. It no longer drives the saga. Until
+the next step, inventory still reacts to it, because the `ReserveStock` consumer does not exist yet.
+
+**Observed:**
+
+- Migration v6 applied. A new order: saga row `RESERVING_STOCK`, 1 record on `orders`, 1 `ReserveStock` on
+  `inventory-commands` with the order ID as key and `eventId` and `eventType` headers.
+- Forced failure: a temporary `CHECK` constraint made the saga insert fail, after `OrderCreated` had
+  already been flushed. API returned 500. The `orders` table, `order_sagas`, both topics and the outbox
+  did not change. Debezium reads only committed changes, so the flushed row never left the database.
+  The constraint was removed after the test.
+- The 2 orders from before this step have no saga row. They were test orders and are left as they are.
