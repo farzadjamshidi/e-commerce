@@ -1957,3 +1957,85 @@ refund has already undone it. No saga has isolation: for a moment the customer r
   the others ignored, `StockReleased` → `CANCELLED`.
 - Laptop stock back to 8/2, `stock.reserved = SUM(RESERVED rows)` for all SKUs. No saga left in a
   middle state: 6 `CANCELLED`, 2 `COMPLETED`.
+
+#### Orchestration summary and comparison (branch `saga-orchestration`)
+
+**Messages on this branch:**
+
+| Topic | Message | From | To |
+|---|---|---|---|
+| `orders` | `OrderCreated` | order | nobody in the saga |
+| `inventory-commands` | `ReserveStock`, `ReleaseStock` | orchestrator | inventory |
+| `payment-commands` | `ChargePayment`, `RefundPayment` | orchestrator | payment |
+| `inventory` | `StockReserved`, `StockRejected`, `StockReleased` | inventory | orchestrator |
+| `payments` | `PaymentCompleted`, `PaymentFailed`, `PaymentRefunded` | payment | orchestrator |
+
+**Measured comparison.** Both branches were run by the same script, each from an empty environment, on one
+laptop. 20 orders per path, one at a time, after 3 warm-up orders. Time is `orders.updated_at - created_at`.
+For the payment failure, "stock back" uses the reservation's `updated_at`.
+
+| Path | Choreography median (min-max) | Orchestration median (min-max) | Messages per order (chor / orch) |
+|---|---|---|---|
+| Success, order `CONFIRMED` | 1412 ms (1315-3864) | 1920 ms (1843-2450) | 3 / 5 |
+| No stock, order `CANCELLED` | 915 ms (723-1926) | 942 ms (823-1911) | 2 / 3 |
+| Payment failed, order `CANCELLED` | 1675 ms (1250-2204) | 3275 ms (2708-3789) | 3 / 7 |
+| Payment failed, stock back | 1677 ms (1256-2180) | 2773 ms (2208-3286) | same run |
+
+Message counts include `OrderCreated`, which no saga step reads on this branch.
+
+**Reading the numbers.** The time follows the number of hops through the outbox and CDC, at roughly 0.5 s each:
+2 hops in both for no stock, 3 vs 4 for success, 3 vs 6 for payment failure. The 0.5 s is an estimate from
+these numbers. Its cause was not measured. On a laptop with an idle system these numbers show the shape,
+not production latency, and throughput was not measured at all.
+
+In orchestration the failed order becomes `CANCELLED` 0.5 s after the stock is back. In choreography both
+happen at about the same time, but independently, so nothing guarantees the stock is back first.
+
+**Scenarios:**
+
+| # | Scenario | Choreography | Orchestration |
+|---|---|---|---|
+| 1 | laptop x1 | `CONFIRMED` | `CONFIRMED` |
+| 2 | no stock | `CANCELLED` | `CANCELLED` |
+| 3 | payment limit | `CANCELLED`, stock released | `CANCELLED`, stock released |
+| 4 | a service down | cancelled by timeout, stock released, money refunded | the same, with compensation in reverse order |
+| 5 | cancel before / after the charge | both needed code: marker row and upsert | "before" cannot happen: same partition |
+| 6 | replay | no change, per topic | no change, all topics at once |
+
+Scenarios 1-3 were run by the script on both branches. Scenarios 4 and 5 come from Choreography 5-7 and
+Orchestration 7-8. Scenario 6 on this branch: all consumer groups reset to earliest, 276 duplicates, no
+orchestrator action, and fingerprints of orders, stock, reservations and payments identical. On the
+choreography branch it was done per topic in each step.
+
+**Structure:**
+
+| | Choreography | Orchestration |
+|---|---|---|
+| Topics | 3 | 5 |
+| Message types | 6 | 11 |
+| Topics a service reads | 2 each (full mesh) | 1 for inventory and payment, 2 for order |
+| Lines added since the branch point (Java + SQL) | 869 | 1182 |
+| of which in order-service | 268 | 689 |
+| Where the flow can be read | three services | `OrderSagaOrchestrator`, 155 lines |
+| Where the state lives | three tables in three databases | `order_sagas`, one row per order |
+| Timeout | one `OrderCancelled` to everybody | per step, only the needed compensation |
+| Compensation order | none | reverse, explicit |
+| Adding shipping (thought test) | changes order, payment, inventory | changes the orchestrator, plus the new service |
+| New failure point | none | order-service: if it is down, every saga stops moving |
+
+Orchestration also added duties that did not exist before: every command needs a reply, even with nothing to do,
+and a compensation must be resent until it is confirmed.
+
+**Known limitations, on both branches:**
+
+- The timeout job has no per-saga error handling. On this branch an exception in `stuck.forEach(action)` stops
+  that run. Because the rollback keeps `updated_at`, the same saga is first again on the next run, so one bad saga can block
+  all timeouts. Choreography's `PendingOrderTimeout` has the same loop shape. Found by reading the code, not tested.
+- Resending has no limit and no backoff, and there is no state for a compensation that can never succeed.
+- Refunds are status changes, not gateway calls.
+- A consumer gives up after 10 quick attempts and drops the message. That is what retry topics and the DLT are for.
+
+**When to choose which:**
+
+- Choreography: few steps, little compensation, teams that must stay independent, and lowest latency.
+- Orchestration: many steps, real compensation, timeouts, and a need to answer "where is this order".
