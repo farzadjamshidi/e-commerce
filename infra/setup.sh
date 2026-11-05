@@ -27,6 +27,9 @@ topics() {
     create_topic "$topic" 3
   done
 
+  # Spring's dead letter publisher keeps the partition number, so a DLT needs as many partitions as its topic
+  create_topic inventory-commands-dlt 3
+
   # Debezium heartbeats: the connector produces to these, and auto-create is off
   for prefix in order-db inventory-db payment-db; do
     create_topic "__debezium-heartbeat.$prefix" 1 --config cleanup.policy=compact

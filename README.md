@@ -2039,3 +2039,51 @@ and a compensation must be resent until it is confirmed.
 
 - Choreography: few steps, little compensation, teams that must stay independent, and lowest latency.
 - Orchestration: many steps, real compensation, timeouts, and a need to answer "where is this order".
+
+#### Failure handling 1: blocking retry and a DLT for inventory
+
+Orchestration won the comparison and is merged to `main`. Until now a failing record was retried 10 times with no
+delay and then dropped: only a log line remained.
+
+**The plan said retry topics. That would break this design.** With retry topics, a failed record moves to another
+topic and the next record of the same key passes it. `ReleaseStock` could then run before `ReserveStock`, and the
+late reservation would never be released. The saga relies on order inside a partition. So:
+
+| | Blocking retry (used here) | Retry topics |
+|---|---|---|
+| Order per key | kept | lost |
+| While retrying | the partition waits | the partition keeps moving |
+| Fits | ordered commands | independent messages |
+
+`KafkaErrorConfig` defines a `DefaultErrorHandler`, which Spring Boot gives to the listener container:
+
+- Exponential backoff: attempts after 1 s, 2 s and 4 s, so 4 attempts and about 7 s in total.
+- `DeadLetterPublishingRecoverer`: after the last attempt the record goes to `inventory-commands-dlt`, in the same
+  partition number, with `kafka_dlt-exception-*` headers. `infra/setup.sh topics` creates that topic with the same
+  3 partitions.
+- `JacksonException` and `IllegalArgumentException` are not retried. A broken payload stays broken, and a retry
+  would only block the partition.
+- `setCommitRecovered(true)`: with manual acks nobody else commits a record that went to the DLT. If it is the last
+  in its partition, a restart would send it to the DLT again.
+
+**The DLT and the timeout work together.** A command in the DLT gets no reply, so the saga stays where it is, and
+the timeout compensates it. Nobody has to act for the customer to get an answer.
+
+**Replaying from the DLT is dangerous.** Taking a `ReserveStock` from the DLT back to its topic after the saga was
+cancelled would reserve stock for a dead order, and nothing would release it. A DLT is for looking at, then deciding
+case by case. It is not an automatic second queue.
+
+**Cost:** a failing record blocks its partition for about 7 s, so other orders on that partition wait too.
+
+**Observed:**
+
+- Broken payload (`not-json`): on the DLT at once, no retry.
+- Failure that heals: a temporary `CHECK` made the reservation insert fail, and it was removed after 3 s. A retry
+  succeeded, the order was `CONFIRMED`, nothing on the DLT.
+- Failure that does not heal: attempts at 0, 1, 3 and 7 s, then the DLT. Each failed attempt rolled back, so stock
+  stayed 9/1. The saga stayed `RESERVING_STOCK`, and the timeout cancelled it: `CANCELLED`, stock 9/1. The test
+  constraint was removed.
+- `setCommitRecovered`: a broken record as the last in its partition. Offset 3 of 3, lag 0, with no later ack to
+  move it. A plain restart earlier left the DLT unchanged.
+
+Order-service and payment still have the old behavior. They are the next step.
