@@ -1731,3 +1731,37 @@ the next step, inventory still reacts to it, because the `ReserveStock` consumer
   did not change. Debezium reads only committed changes, so the flushed row never left the database.
   The constraint was removed after the test.
 - The 2 orders from before this step have no saga row. They were test orders and are left as they are.
+
+#### Orchestration 3: inventory obeys `ReserveStock` (branch `saga-orchestration`)
+
+Inventory no longer reacts to `OrderCreated`. It reads `inventory-commands` and answers on `inventory`.
+
+- `StockCommandListener` + `StockCommandHandler` replace `OrderEventListener` + `OrderEventHandler`.
+  `OrderCreatedEvent` is gone from inventory. It no longer knows that orders exist as events.
+- In one transaction: inbox row, stock update, reservation row, reply through `OutboxWriter`.
+- The command ID is used as the inbox key, so a repeated command has no effect.
+
+| Reply | When | Payload |
+|---|---|---|
+| `StockReserved` | Conditional `UPDATE stock` matched | `orderId` |
+| `StockRejected` | No row matched | `orderId`, `reason: INSUFFICIENT_STOCK` |
+
+**Compare with choreography.** `InventoryReserved` carried `sku`, `quantity`, `customerId`, `totalAmount`
+and `currency`, because the next service read it directly. `StockReserved` carries only `orderId`.
+The reply goes to the orchestrator, which already has the order. Inventory does not know that payment
+exists, or what comes next.
+
+**A limit to remember.** If the orchestrator ever resends `ReserveStock`, it must reuse the same command
+ID. With a new ID the inbox would not catch it: stock would be taken, and the insert into `reservations`
+would then fail on the primary key, roll back, and be retried as a failing message. The orchestrator
+does not resend yet.
+
+**Observed:**
+
+- On start: `OutboxSmokeTest` ignored, the waiting `ReserveStock` of step 2 → 2 laptops reserved,
+  `StockReserved` on `inventory`.
+- Live: phone x5 → `StockRejected` with `INSUFFICIENT_STOCK`, phone x1 → `StockReserved`, both keyed by
+  order ID. Stock laptop 7/3, phone 2/1. `OrderCreated` of these orders reserved nothing.
+- Replay of `inventory-commands` from earliest: 3 duplicates, 1 ignored, stock unchanged, `inventory`
+  topic still 3 records.
+- Nobody reads the replies yet, so these sagas stay in `RESERVING_STOCK`. That is the next step.

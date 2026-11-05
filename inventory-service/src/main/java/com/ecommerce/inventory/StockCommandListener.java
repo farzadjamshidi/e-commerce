@@ -13,28 +13,27 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
 @Component
-class OrderEventListener {
+class StockCommandListener {
 
-    private static final Logger log = LoggerFactory.getLogger(OrderEventListener.class);
+    private static final Logger log = LoggerFactory.getLogger(StockCommandListener.class);
 
-    private final OrderEventHandler orderEventHandler;
+    private final StockCommandHandler stockCommandHandler;
     private final long processingDelayMs;
 
-    OrderEventListener(OrderEventHandler orderEventHandler,
+    StockCommandListener(StockCommandHandler stockCommandHandler,
                        @Value("${inventory.processing-delay-ms:0}") long processingDelayMs) {
-        this.orderEventHandler = orderEventHandler;
+        this.stockCommandHandler = stockCommandHandler;
         this.processingDelayMs = processingDelayMs;
     }
 
-    @KafkaListener(topics = "orders")
-    void onOrderEvent(ConsumerRecord<String, String> record, Acknowledgment ack) throws InterruptedException {
+    @KafkaListener(topics = "inventory-commands")
+    void onStockCommand(ConsumerRecord<String, String> record, Acknowledgment ack) throws InterruptedException {
         Thread.sleep(processingDelayMs);
         String eventId = header(record, "eventId");
         if (eventId == null) {
-            // Messages from before the outbox have no eventId and cannot be deduplicated
             log.warn("No eventId header <- partition {} offset {}, skipped", record.partition(), record.offset());
         } else {
-            orderEventHandler.handle(UUID.fromString(eventId), header(record, "eventType"), record.value());
+            stockCommandHandler.handle(UUID.fromString(eventId), header(record, "eventType"), record.value());
         }
         // Acknowledged only after the database commit. A crash in between means redelivery, which the inbox absorbs.
         ack.acknowledge();
