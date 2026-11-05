@@ -85,6 +85,15 @@ class OrderSagaOrchestrator {
         log.info("Order {}: stock released, cancelled", orderId);
     }
 
+    // Compensations run in reverse order: the money first, then the stock
+    @Transactional(propagation = Propagation.MANDATORY)
+    void onPaymentRefunded(UUID orderId) {
+        if (moved(orderId, SagaState.REFUNDING_PAYMENT, SagaState.RELEASING_STOCK)) {
+            sendReleaseStock(orderId);
+            log.info("Order {}: payment refunded, releasing stock", orderId);
+        }
+    }
+
     // No reply yet, so inventory may or may not have reserved. ReleaseStock has the same key as ReserveStock,
     // so inventory reads it afterwards. A late StockReserved finds the saga in RELEASING_STOCK and is ignored.
     @Transactional
@@ -103,6 +112,31 @@ class OrderSagaOrchestrator {
             sendReleaseStock(orderId);
             log.warn("Order {}: still no StockReleased, sending ReleaseStock again", orderId);
         }
+    }
+
+    // No reply yet, so the customer may or may not be charged. RefundPayment has the same key as ChargePayment,
+    // so payment reads it afterwards. A late PaymentCompleted finds the saga in REFUNDING_PAYMENT and is ignored.
+    @Transactional
+    void onPaymentTimeout(UUID orderId) {
+        if (moved(orderId, SagaState.CHARGING_PAYMENT, SagaState.REFUNDING_PAYMENT)) {
+            sendRefundPayment(orderId);
+            log.warn("Order {}: no reply from payment, refunding", orderId);
+        }
+    }
+
+    // Sent again with a new command ID, for the same reason as ReleaseStock: refund is idempotent by status
+    @Transactional
+    void onRefundTimeout(UUID orderId) {
+        if (moved(orderId, SagaState.REFUNDING_PAYMENT, SagaState.REFUNDING_PAYMENT)) {
+            sendRefundPayment(orderId);
+            log.warn("Order {}: still no PaymentRefunded, sending RefundPayment again", orderId);
+        }
+    }
+
+    private void sendRefundPayment(UUID orderId) {
+        RefundPaymentCommand command = RefundPaymentCommand.of(orderId);
+        outboxWriter.write(command.commandId(), PAYMENT_COMMANDS_TOPIC, orderId, command.commandType(), command,
+                command.issuedAt());
     }
 
     private void sendReleaseStock(UUID orderId) {

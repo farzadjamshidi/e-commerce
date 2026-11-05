@@ -35,7 +35,7 @@ class PaymentCommandHandler {
     // The inbox row, the payment row and the reply commit together
     @Transactional
     void handle(UUID commandId, String commandType, String payload) {
-        if (!ChargePaymentCommand.TYPE.equals(commandType)) {
+        if (!ChargePaymentCommand.TYPE.equals(commandType) && !RefundPaymentCommand.TYPE.equals(commandType)) {
             log.info("Ignored {} {}", commandType, commandId);
             return;
         }
@@ -43,7 +43,14 @@ class PaymentCommandHandler {
             log.info("Duplicate {} {}, skipped", commandType, commandId);
             return;
         }
-        ChargePaymentCommand command = jsonMapper.readValue(payload, ChargePaymentCommand.class);
+        if (ChargePaymentCommand.TYPE.equals(commandType)) {
+            charge(jsonMapper.readValue(payload, ChargePaymentCommand.class));
+        } else {
+            refund(jsonMapper.readValue(payload, RefundPaymentCommand.class));
+        }
+    }
+
+    private void charge(ChargePaymentCommand command) {
         String orderId = command.orderId().toString();
         // Simulated gateway: a deterministic rule makes the failure path easy to trigger
         boolean approved = command.amount().compareTo(maxAmount) <= 0;
@@ -64,5 +71,14 @@ class PaymentCommandHandler {
             log.warn("Payment failed for order {}: {} {} over limit {}", orderId, command.amount(),
                     command.currency(), maxAmount);
         }
+    }
+
+    // Always answers, even with nothing to refund: the saga is waiting. RefundPayment has the same key as
+    // ChargePayment, so the charge was already handled here, and a failed one simply has nothing to give back.
+    private void refund(RefundPaymentCommand command) {
+        int refunded = paymentRepository.refund(command.orderId());
+        PaymentRefundedEvent reply = PaymentRefundedEvent.from(command);
+        outboxWriter.write(reply.eventId(), AGGREGATE_TYPE, command.orderId().toString(), reply.eventType(), reply);
+        log.info("Refund for order {}: {} payment refunded", command.orderId(), refunded);
     }
 }

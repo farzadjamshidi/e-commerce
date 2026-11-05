@@ -17,4 +17,11 @@ interface PaymentRepository extends JpaRepository<Payment, UUID> {
             ON CONFLICT (order_id) DO NOTHING""", nativeQuery = true)
     int insertIfAbsent(UUID orderId, String customerId, BigDecimal amount, String currency, String status,
                        String reason);
+
+    // Only a COMPLETED payment is refunded, so a second refund changes nothing
+    @Modifying
+    @Query(value = """
+            UPDATE payments SET status = 'REFUNDED', updated_at = now()
+            WHERE order_id = :orderId AND status = 'COMPLETED'""", nativeQuery = true)
+    int refund(UUID orderId);
 }

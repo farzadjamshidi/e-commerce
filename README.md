@@ -1918,3 +1918,42 @@ reusing the command ID applies to `ReserveStock`, which is not idempotent by its
 - Inventory started: within about 75 ms it reserved 1, released 1, then released 0 twice.
 - Orchestrator: late `StockReserved` ignored, first `StockReleased` → `CANCELLED`, the other two ignored.
 - Phone stock 2/1 before and after. Order `CANCELLED`, version 1. Reservation `RELEASED`.
+
+#### Orchestration 8: timeout while charging, refund (branch `saga-orchestration`)
+
+The last unanswered state. A new state `REFUNDING_PAYMENT` and a new command `RefundPayment`:
+
+```
+CHARGING_PAYMENT ──timeout / RefundPayment──► REFUNDING_PAYMENT ──PaymentRefunded / ReleaseStock──► RELEASING_STOCK
+```
+
+- Order-service: `SagaTimeout` also checks `CHARGING_PAYMENT` and `REFUNDING_PAYMENT`. The orchestrator gets
+  `onPaymentTimeout`, `onRefundTimeout` and `onPaymentRefunded`.
+- Payment: `RefundPayment` runs `UPDATE payments SET status = 'REFUNDED' ... WHERE status = 'COMPLETED'` and
+  always replies `PaymentRefunded`. `V4__add_payment_updated_at.sql` adds `updated_at`.
+
+**Compensations run in reverse order.** The money first, then the stock. That is the rule from the original
+Sagas paper: undo the last step first. In choreography both reacted to `OrderCancelled` at the same time, with
+no order between them.
+
+**No marker row, no upsert.** On the choreography branch, the cancel could reach payment before the charge,
+so payment needed a `CANCELLED` marker row, nullable columns and `INSERT ... ON CONFLICT DO UPDATE`. Here
+`RefundPayment` is behind `ChargePayment` in one partition, so the charge has always been handled first. Refund
+is a plain conditional `UPDATE`.
+
+**A timed-out charge is an unknown, not a failure.** The orchestrator cannot tell if the money moved. So it does
+not skip to `ReleaseStock`. It asks for a refund and waits. A late `PaymentCompleted` is ignored, and the
+refund has already undone it. No saga has isolation: for a moment the customer really was charged.
+
+**Observed** (payment down, two orders: 1499.99 and 2999.98):
+
+- 15 s: both `CHARGING_PAYMENT`. 40 s: both `REFUNDING_PAYMENT`. `RefundPayment` sent again until payment
+  came back. Laptop stock 5/5 while waiting.
+- In each partition `ChargePayment` was ahead of the `RefundPayment`s.
+- Payment started:
+  - 1499.99: charged, refunded (1 row), then 2 refunds of 0 rows. Row `REFUNDED`.
+  - 2999.98: failed, then 3 refunds of 0 rows. Row `FAILED`.
+- Orchestrator: the late `PaymentCompleted` and `PaymentFailed` ignored, first `PaymentRefunded` → `RELEASING_STOCK`,
+  the others ignored, `StockReleased` → `CANCELLED`.
+- Laptop stock back to 8/2, `stock.reserved = SUM(RESERVED rows)` for all SKUs. No saga left in a
+  middle state: 6 `CANCELLED`, 2 `COMPLETED`.

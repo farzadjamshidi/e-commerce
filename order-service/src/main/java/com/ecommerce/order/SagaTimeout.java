@@ -36,6 +36,8 @@ class SagaTimeout {
     void checkStuckSagas() {
         Instant before = Instant.now().minus(after);
         check(SagaState.RESERVING_STOCK, before, orderSagaOrchestrator::onReservationTimeout);
+        check(SagaState.CHARGING_PAYMENT, before, orderSagaOrchestrator::onPaymentTimeout);
+        check(SagaState.REFUNDING_PAYMENT, before, orderSagaOrchestrator::onRefundTimeout);
         check(SagaState.RELEASING_STOCK, before, orderSagaOrchestrator::onReleaseTimeout);
     }
 

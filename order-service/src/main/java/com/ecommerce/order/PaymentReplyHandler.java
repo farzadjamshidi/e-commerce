@@ -1,5 +1,6 @@
 package com.ecommerce.order;
 
+import java.util.Set;
 import java.util.UUID;
 
 import org.slf4j.Logger;
@@ -12,6 +13,8 @@ import tools.jackson.databind.json.JsonMapper;
 class PaymentReplyHandler {
 
     private static final Logger log = LoggerFactory.getLogger(PaymentReplyHandler.class);
+    private static final Set<String> HANDLED =
+            Set.of(PaymentReply.COMPLETED, PaymentReply.FAILED, PaymentReply.REFUNDED);
 
     private final ProcessedEventRepository processedEventRepository;
     private final OrderSagaOrchestrator orderSagaOrchestrator;
@@ -27,7 +30,7 @@ class PaymentReplyHandler {
     // The inbox row, the saga step and the next command commit together
     @Transactional
     void handle(UUID eventId, String eventType, String payload) {
-        if (!PaymentReply.COMPLETED.equals(eventType) && !PaymentReply.FAILED.equals(eventType)) {
+        if (!HANDLED.contains(eventType)) {
             log.info("Ignored {} {}", eventType, eventId);
             return;
         }
@@ -36,10 +39,10 @@ class PaymentReplyHandler {
             return;
         }
         PaymentReply reply = jsonMapper.readValue(payload, PaymentReply.class);
-        if (PaymentReply.COMPLETED.equals(eventType)) {
-            orderSagaOrchestrator.onPaymentCompleted(reply.orderId());
-        } else {
-            orderSagaOrchestrator.onPaymentFailed(reply.orderId(), reply.reason());
+        switch (eventType) {
+            case PaymentReply.COMPLETED -> orderSagaOrchestrator.onPaymentCompleted(reply.orderId());
+            case PaymentReply.FAILED -> orderSagaOrchestrator.onPaymentFailed(reply.orderId(), reply.reason());
+            default -> orderSagaOrchestrator.onPaymentRefunded(reply.orderId());
         }
     }
 }

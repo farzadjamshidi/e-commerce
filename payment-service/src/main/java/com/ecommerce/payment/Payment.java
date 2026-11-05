@@ -36,6 +36,9 @@ class Payment {
     @Column(nullable = false, insertable = false, updatable = false)
     private Instant createdAt;
 
+    @Column(nullable = false, insertable = false, updatable = false)
+    private Instant updatedAt;
+
     protected Payment() {
     }
 }
