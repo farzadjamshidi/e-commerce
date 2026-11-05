@@ -1,5 +1,6 @@
 package com.ecommerce.order;
 
+import java.util.Set;
 import java.util.UUID;
 
 import org.slf4j.Logger;
@@ -12,6 +13,7 @@ import tools.jackson.databind.json.JsonMapper;
 class InventoryReplyHandler {
 
     private static final Logger log = LoggerFactory.getLogger(InventoryReplyHandler.class);
+    private static final Set<String> HANDLED = Set.of(StockReply.RESERVED, StockReply.REJECTED, StockReply.RELEASED);
 
     private final ProcessedEventRepository processedEventRepository;
     private final OrderSagaOrchestrator orderSagaOrchestrator;
@@ -27,7 +29,7 @@ class InventoryReplyHandler {
     // The inbox row, the saga step and the next command commit together
     @Transactional
     void handle(UUID eventId, String eventType, String payload) {
-        if (!StockReply.RESERVED.equals(eventType) && !StockReply.REJECTED.equals(eventType)) {
+        if (!HANDLED.contains(eventType)) {
             log.info("Ignored {} {}", eventType, eventId);
             return;
         }
@@ -36,10 +38,10 @@ class InventoryReplyHandler {
             return;
         }
         StockReply reply = jsonMapper.readValue(payload, StockReply.class);
-        if (StockReply.RESERVED.equals(eventType)) {
-            orderSagaOrchestrator.onStockReserved(reply.orderId());
-        } else {
-            orderSagaOrchestrator.onStockRejected(reply.orderId(), reply.reason());
+        switch (eventType) {
+            case StockReply.RESERVED -> orderSagaOrchestrator.onStockReserved(reply.orderId());
+            case StockReply.REJECTED -> orderSagaOrchestrator.onStockRejected(reply.orderId(), reply.reason());
+            default -> orderSagaOrchestrator.onStockReleased(reply.orderId());
         }
     }
 }

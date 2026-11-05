@@ -30,12 +30,12 @@ class StockCommandHandler {
         this.jsonMapper = jsonMapper;
     }
 
-    // The inbox row, the stock change, the reservation row and the reply commit together
+    // The inbox row, the stock and reservation changes and the reply commit together
     @Transactional
     void handle(UUID commandId, String commandType, String payload) {
         // Checked before the inbox: an ignored type must not be marked processed,
         // or it would be skipped as a duplicate once this service starts handling it
-        if (!ReserveStockCommand.TYPE.equals(commandType)) {
+        if (!ReserveStockCommand.TYPE.equals(commandType) && !ReleaseStockCommand.TYPE.equals(commandType)) {
             log.info("Ignored {} {}", commandType, commandId);
             return;
         }
@@ -43,7 +43,14 @@ class StockCommandHandler {
             log.info("Duplicate {} {}, skipped", commandType, commandId);
             return;
         }
-        ReserveStockCommand command = jsonMapper.readValue(payload, ReserveStockCommand.class);
+        if (ReserveStockCommand.TYPE.equals(commandType)) {
+            reserve(jsonMapper.readValue(payload, ReserveStockCommand.class));
+        } else {
+            release(jsonMapper.readValue(payload, ReleaseStockCommand.class));
+        }
+    }
+
+    private void reserve(ReserveStockCommand command) {
         String orderId = command.orderId().toString();
         if (stockRepository.reserve(command.sku(), command.quantity()) == 1) {
             reservationRepository.insertReserved(command.orderId(), command.sku(), command.quantity());
@@ -56,5 +63,13 @@ class StockCommandHandler {
             outboxWriter.write(rejected.eventId(), AGGREGATE_TYPE, orderId, rejected.eventType(), rejected);
             log.warn("Insufficient stock for {} x {}, order {}", command.quantity(), command.sku(), orderId);
         }
+    }
+
+    // Always answers, even with nothing to release: the saga is waiting, and silence would leave it stuck
+    private void release(ReleaseStockCommand command) {
+        int released = reservationRepository.release(command.orderId());
+        StockReleasedEvent reply = StockReleasedEvent.from(command);
+        outboxWriter.write(reply.eventId(), AGGREGATE_TYPE, command.orderId().toString(), reply.eventType(), reply);
+        log.info("Release for order {}: {} reservation released", command.orderId(), released);
     }
 }

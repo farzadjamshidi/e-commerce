@@ -1834,3 +1834,44 @@ orchestrator already has them.
   `payments` table and topic unchanged. The primary key works as a guard without the inbox.
 - Nobody reads these replies yet, so both sagas stay in `CHARGING_PAYMENT`. c-saga's 2 laptops also stay
   reserved. That is the next step.
+
+#### Orchestration 6: the saga ends, with compensation (branch `saga-orchestration`)
+
+Order-service now also reads `payments`. Inventory also handles `ReleaseStock`. The full state machine:
+
+```
+RESERVING_STOCK ──StockRejected──────────────────────────────► CANCELLED
+      │ StockReserved / ChargePayment
+      ▼
+CHARGING_PAYMENT ──PaymentCompleted──► COMPLETED (order CONFIRMED)
+      │ PaymentFailed / ReleaseStock
+      ▼
+RELEASING_STOCK ──StockReleased──────────────────────────────► CANCELLED
+```
+
+- `PaymentReplyListener` + `PaymentReplyHandler`, the same shape as the inventory replies.
+- `OrderSagaOrchestrator`: `onPaymentCompleted`, `onPaymentFailed`, `onStockReleased`.
+- Inventory: `ReleaseStockCommand`, `StockReleasedEvent`, and the same one-statement `release` as on the
+  choreography branch.
+
+**The order stays `PENDING` until the stock is back.** `CANCELLED` then means the compensation has
+finished. A customer who sees it can trust that nothing is held. It costs one more round trip. In
+choreography, order-service cancelled on `PaymentFailed` while inventory released on its own, so the order
+could be `CANCELLED` while the stock was still reserved.
+
+**`ReleaseStock` always gets a reply, even with nothing to release.** The orchestrator is waiting. In
+choreography a compensation could stay silent, because nobody waited for it. Here silence would leave the
+saga in `RELEASING_STOCK`. This is a new duty that commands bring.
+
+**Observed:**
+
+- Waiting replies: c-ok → `COMPLETED` / `CONFIRMED`. c-saga → `RELEASING_STOCK`, 2 laptops released, then
+  `CANCELLED`. Laptop stock 7/3 → 9/1.
+- Live: laptop x1 → `CONFIRMED`. Laptop x2 (2999.98) → `CANCELLED`, 7 steps in 3.1 s:
+  started, reserved, charging, failed, releasing, released, cancelled. Laptop 9/1 → 8/2.
+  `stock.reserved = SUM(RESERVED rows)` held for all SKUs.
+- `inventory-commands` replayed after deleting the `ReleaseStock` inbox rows: 2 releases with 0
+  reservations, stock unchanged. Each sent a new `StockReleased` with a new event ID, so the inbox could
+  not catch it. The orchestrator ignored both: "saga is not in RELEASING_STOCK".
+- Order-service replayed both reply topics: duplicates only. The fingerprint (md5) of sagas and orders
+  was the same before and after.

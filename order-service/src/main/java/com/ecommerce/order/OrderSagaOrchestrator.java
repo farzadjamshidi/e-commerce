@@ -57,6 +57,36 @@ class OrderSagaOrchestrator {
         log.info("Order {}: stock rejected ({}), cancelled", orderId, reason);
     }
 
+    @Transactional(propagation = Propagation.MANDATORY)
+    void onPaymentCompleted(UUID orderId) {
+        if (!moved(orderId, SagaState.CHARGING_PAYMENT, SagaState.COMPLETED)) {
+            return;
+        }
+        orderRepository.completePending(orderId, OrderStatus.CONFIRMED.name());
+        log.info("Order {}: payment completed, confirmed", orderId);
+    }
+
+    // The order stays PENDING until the stock is back: CANCELLED means the compensation is finished
+    @Transactional(propagation = Propagation.MANDATORY)
+    void onPaymentFailed(UUID orderId, String reason) {
+        if (!moved(orderId, SagaState.CHARGING_PAYMENT, SagaState.RELEASING_STOCK)) {
+            return;
+        }
+        ReleaseStockCommand command = ReleaseStockCommand.of(orderId);
+        outboxWriter.write(command.commandId(), INVENTORY_COMMANDS_TOPIC, orderId, command.commandType(), command,
+                command.issuedAt());
+        log.info("Order {}: payment failed ({}), releasing stock", orderId, reason);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    void onStockReleased(UUID orderId) {
+        if (!moved(orderId, SagaState.RELEASING_STOCK, SagaState.CANCELLED)) {
+            return;
+        }
+        orderRepository.completePending(orderId, OrderStatus.CANCELLED.name());
+        log.info("Order {}: stock released, cancelled", orderId);
+    }
+
     private boolean moved(UUID orderId, SagaState from, SagaState to) {
         if (orderSagaRepository.transition(orderId, from.name(), to.name()) == 1) {
             return true;
