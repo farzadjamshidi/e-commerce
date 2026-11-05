@@ -1765,3 +1765,38 @@ does not resend yet.
 - Replay of `inventory-commands` from earliest: 3 duplicates, 1 ignored, stock unchanged, `inventory`
   topic still 3 records.
 - Nobody reads the replies yet, so these sagas stay in `RESERVING_STOCK`. That is the next step.
+
+#### Orchestration 4: the orchestrator reads inventory's reply (branch `saga-orchestration`)
+
+Order-service now also consumes.
+
+- `V7__create_processed_events.sql`: the inbox. Consumer config: group `order-service`,
+  `group.protocol: consumer`, `manual_immediate` acks.
+- `InventoryReplyListener` + `InventoryReplyHandler` on `inventory`: type check, inbox, then the
+  orchestrator, all in one transaction.
+- `StockReply(orderId, reason)`: one tolerant record for both replies.
+
+| Reply | Saga state | Order status | Next |
+|---|---|---|---|
+| `StockReserved` | `RESERVING_STOCK` → `CHARGING_PAYMENT` | stays `PENDING` | `ChargePayment` on `payment-commands` |
+| `StockRejected` | `RESERVING_STOCK` → `CANCELLED` | `CANCELLED` | nothing to compensate |
+
+**The state machine is one conditional update.** `OrderSagaRepository.transition(orderId, from, to)`
+runs `UPDATE ... WHERE order_id = :orderId AND state = :from`. A reply is valid only in the state that
+expects it. 0 rows means a late or repeated reply: it is logged and changes nothing. So all flow logic
+now sits in one class, `OrderSagaOrchestrator`: reading it shows the whole saga. In choreography that
+required reading three services.
+
+**`ChargePayment` is built from the order.** `customerId`, `amount` and `currency` come from the `orders`
+table, in the same database. Inventory did not carry them.
+
+**Observed:**
+
+- On start, migration v7 applied, and the 3 waiting replies were handled:
+  - c-saga (2999.98) and c-ok (699.00): `CHARGING_PAYMENT`, order `PENDING`, `ChargePayment` with the
+    right amount, keyed by order ID.
+  - c-nostock: saga and order `CANCELLED`, order `version` 1.
+- Replay of `inventory` from earliest: 2 duplicate `StockReserved`, 1 duplicate `StockRejected`.
+- Replay again after deleting the inbox rows: 3 times "saga is not in RESERVING_STOCK, reply ignored".
+  `payment-commands` stayed at 3 records (1 smoke test + 2 commands), statuses and versions unchanged. The
+  state guard works without the inbox.
