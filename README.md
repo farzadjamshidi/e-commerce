@@ -1875,3 +1875,46 @@ saga in `RELEASING_STOCK`. This is a new duty that commands bring.
   not catch it. The orchestrator ignored both: "saga is not in RELEASING_STOCK".
 - Order-service replayed both reply topics: duplicates only. The fingerprint (md5) of sagas and orders
   was the same before and after.
+
+#### Orchestration 7: timeout while reserving and releasing (branch `saga-orchestration`)
+
+`SagaTimeout`, a `@Scheduled` job (every 5 s), finds sagas that stayed in one state longer than
+`order.saga-timeout.after` (30 s). `updated_at` is reset by every transition, so the time is per step, not
+per saga. `V8__index_sagas_by_state.sql` adds an index on `(state, updated_at)`.
+
+| Stuck in | Meaning | Action |
+|---|---|---|
+| `RESERVING_STOCK` | Unknown if inventory reserved | move to `RELEASING_STOCK`, send `ReleaseStock` |
+| `RELEASING_STOCK` | Compensation not confirmed | send `ReleaseStock` again |
+| `CHARGING_PAYMENT` | Unknown if payment charged | **not handled yet**, next step |
+
+**Compare with choreography.** There the timeout knew only "this order is `PENDING`", so one
+`OrderCancelled` went to everybody, and each service had to work out what it meant. Here the saga row says
+which step is unanswered, so the orchestrator sends only the compensation that step needs.
+
+**"Release before reserve" cannot happen.** `ReleaseStock` has the same key and topic as `ReserveStock`, so
+it is in the same partition, behind it. A slow inventory reserves first and releases second. The late
+`StockReserved` finds the saga in `RELEASING_STOCK` and is ignored. In choreography payment read two
+topics, so the same race needed a marker row and an upsert. One command topic per service, keyed by order,
+removes that case.
+
+**A compensation cannot give up.** Moving forward can stop at any point, but once compensation has started
+it must finish, or stock stays locked. So `ReleaseStock` is sent again each timeout until `StockReleased`
+arrives. It uses a new command ID on purpose: the inbox would swallow the old ID and no reply would
+come. This is safe because `release` is idempotent by `status = 'RESERVED'`. The Orchestration 3 note about
+reusing the command ID applies to `ReserveStock`, which is not idempotent by itself.
+
+**Costs:**
+
+- While inventory is down, one more `ReleaseStock` is written per timeout, and the order stays `PENDING`.
+  There is no limit or backoff yet. A real system would alert after N attempts.
+- Two order-service instances could both resend. That would be harmless because of the idempotent release.
+  Not tested.
+
+**Observed** (inventory down, phone x1):
+
+- 20 s: `RESERVING_STOCK`. 40 s: `RELEASING_STOCK`. `ReleaseStock` was sent again at 60 s and 90 s.
+- `inventory-commands`: `ReserveStock`, then the `ReleaseStock`s, all in partition 0, offsets in order.
+- Inventory started: within about 75 ms it reserved 1, released 1, then released 0 twice.
+- Orchestrator: late `StockReserved` ignored, first `StockReleased` → `CANCELLED`, the other two ignored.
+- Phone stock 2/1 before and after. Order `CANCELLED`, version 1. Reservation `RELEASED`.

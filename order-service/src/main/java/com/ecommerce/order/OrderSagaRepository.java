@@ -4,6 +4,8 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.Repository;
 
+import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 interface OrderSagaRepository extends Repository<OrderSaga, UUID> {
@@ -19,4 +21,9 @@ interface OrderSagaRepository extends Repository<OrderSaga, UUID> {
             UPDATE order_sagas SET state = :to, updated_at = now()
             WHERE order_id = :orderId AND state = :from""", nativeQuery = true)
     int transition(UUID orderId, String from, String to);
+
+    @Query(value = """
+            SELECT order_id FROM order_sagas WHERE state = :state AND updated_at < :before
+            ORDER BY updated_at LIMIT :limit""", nativeQuery = true)
+    List<UUID> findStuck(String state, Instant before, int limit);
 }

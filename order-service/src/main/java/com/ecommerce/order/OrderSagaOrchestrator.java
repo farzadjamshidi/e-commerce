@@ -72,9 +72,7 @@ class OrderSagaOrchestrator {
         if (!moved(orderId, SagaState.CHARGING_PAYMENT, SagaState.RELEASING_STOCK)) {
             return;
         }
-        ReleaseStockCommand command = ReleaseStockCommand.of(orderId);
-        outboxWriter.write(command.commandId(), INVENTORY_COMMANDS_TOPIC, orderId, command.commandType(), command,
-                command.issuedAt());
+        sendReleaseStock(orderId);
         log.info("Order {}: payment failed ({}), releasing stock", orderId, reason);
     }
 
@@ -85,6 +83,32 @@ class OrderSagaOrchestrator {
         }
         orderRepository.completePending(orderId, OrderStatus.CANCELLED.name());
         log.info("Order {}: stock released, cancelled", orderId);
+    }
+
+    // No reply yet, so inventory may or may not have reserved. ReleaseStock has the same key as ReserveStock,
+    // so inventory reads it afterwards. A late StockReserved finds the saga in RELEASING_STOCK and is ignored.
+    @Transactional
+    void onReservationTimeout(UUID orderId) {
+        if (moved(orderId, SagaState.RESERVING_STOCK, SagaState.RELEASING_STOCK)) {
+            sendReleaseStock(orderId);
+            log.warn("Order {}: no reply from inventory, releasing stock", orderId);
+        }
+    }
+
+    // A compensation must finish, so it is sent again until inventory answers.
+    // A new command ID on purpose: the inbox would swallow the old one, and release is idempotent by status.
+    @Transactional
+    void onReleaseTimeout(UUID orderId) {
+        if (moved(orderId, SagaState.RELEASING_STOCK, SagaState.RELEASING_STOCK)) {
+            sendReleaseStock(orderId);
+            log.warn("Order {}: still no StockReleased, sending ReleaseStock again", orderId);
+        }
+    }
+
+    private void sendReleaseStock(UUID orderId) {
+        ReleaseStockCommand command = ReleaseStockCommand.of(orderId);
+        outboxWriter.write(command.commandId(), INVENTORY_COMMANDS_TOPIC, orderId, command.commandType(), command,
+                command.issuedAt());
     }
 
     private boolean moved(UUID orderId, SagaState from, SagaState to) {
