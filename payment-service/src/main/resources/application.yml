@@ -19,3 +19,7 @@ spring:
         "[group.protocol]": consumer
     listener:
       ack-mode: manual_immediate
+
+payment:
+  # Simulated gateway: orders above this amount are declined
+  max-amount: 2000

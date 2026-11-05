@@ -1620,3 +1620,422 @@ The smoke test (`INSERT` + `DELETE` in one transaction as `payment_service`) arr
 | payment-service | `payment_db` | `payments` | `processed_events` | `payment-outbox` |
 
 This is the branch point. Both Saga styles start from here.
+
+#### Orchestration 0: a fresh environment per branch (branch `saga-orchestration`)
+
+Both saga branches use the same Postgres and Kafka, but their schemas grow apart. Choreography had
+already applied order `V5`/`V6` and payment `V3`/`V4`. A different `V5` on this branch would fail
+Flyway's checksum check. The data of one branch would also blur the comparison. So each branch starts
+from an empty environment.
+
+The Kafka containers have no volume: topics, offsets and connector configs live in the containers. The
+Postgres data lives in the `postgres-data` volume. `docker compose down -v` removes both.
+
+`infra/setup.sh` rebuilds what used to be typed by hand. It is safe to run again: `--if-not-exists` for
+topics, and `PUT` for connectors.
+
+```bash
+docker compose down -v && docker compose up -d
+infra/setup.sh topics        # orders, inventory, payments + Debezium heartbeat topics
+# start each service once: Flyway creates the tables and the publications
+infra/setup.sh connectors    # fails if a publication does not exist yet
+```
+
+The connectors come after the services because `publication.autocreate.mode` is `disabled`. Each
+publication is created by that service's own migration. Run this whenever you switch saga branch.
+
+**Observed:** containers and volume removed. 13 topics after `setup.sh topics` (3 business, 6
+heartbeat, 4 internal). Migrations order v4, inventory v4, payment v2. 3 connectors `RUNNING`, 3 slots
+active. A test order was reserved by inventory, as on `main`.
+
+#### Orchestration 1: one outbox, several topics (branch `saga-orchestration`)
+
+The orchestrator sends commands to other services, so order-service must now write to more than one
+topic. Commands get their own topics:
+
+| Topic | Direction | Content |
+|---|---|---|
+| `orders` | order → anyone | events about orders |
+| `inventory-commands` | orchestrator → inventory | `ReserveStock`, `ReleaseStock` |
+| `payment-commands` | orchestrator → payment | `ChargePayment` |
+| `inventory`, `payments` | service → orchestrator | replies |
+
+**Why separate command topics.** An event says "this happened" and the producer does not care who reads
+it. A command says "do this" and has exactly one receiver. Separate topics keep that visible, and they
+let the two be sized and secured differently.
+
+Changes:
+
+- `V5__add_outbox_destination.sql`: `outbox_events.destination`. The default only fills existing rows and
+  is then dropped, so every new write must choose a topic.
+- Connector: `route.by.field: destination`, `route.topic.replacement: ${routedByValue}`. The topic now
+  comes from the row. It was fixed to `orders` before.
+- `OutboxEvent.create` takes the destination. `OutboxRelay` reads it too, so its aggregate-to-topic map is gone.
+- `infra/setup.sh topics` also creates the two command topics (3 partitions, RF 3).
+
+**Why a new column and not `aggregate_type`.** Routing by `aggregate_type` would work only if its value
+were the topic name. But a `ReserveStock` command is about an `Order` and goes to `inventory-commands`.
+The two values answer different questions.
+
+**Deployment order matters.** The migration must run before the new connector config. The other way
+round, the router looks for a column that does not exist yet.
+
+**Risk: a wrong destination.** Topic auto-creation is off. A row with an unknown topic would likely fail the
+connector task, and that stops every later event of this database, not just the bad one. Not tested. The
+destinations are constants in the code for this reason.
+
+**Observed:**
+
+- Migration v5 applied, connector config updated with `PUT`, task `RUNNING`.
+- A real order → `OrderCreated` on `orders`, as before.
+- Two test rows (inserted and deleted in one transaction): one arrived on `inventory-commands`, one on
+  `payment-commands`, each with its `aggregate_id` as the key. `outbox_events` empty. The two
+  `OutboxSmokeTest` records stay on the command topics, so their consumers must ignore unknown types.
+
+**Observed by accident: CDC delivers at least once.** `orders` already had 2 records for 1 order, with the
+same `eventId`. The first was written when the order was placed. The second was written 15 s after Connect
+came back from a Docker restart: Connect resumed from its last stored offset and read the same WAL
+entry again. Why the stored offset was behind that entry was not investigated. This is why the inbox
+exists: the outbox gives at-least-once delivery, and only the consumer's deduplication makes it
+effectively once.
+
+#### Orchestration 2: the saga starts with `placeOrder` (branch `saga-orchestration`)
+
+The orchestrator lives inside order-service. The order is what the saga is about, so the saga state and
+the order status share one database and one transaction, and there is no extra service to deploy. A
+larger system might use a separate service or an engine such as Temporal or Camunda.
+
+- `V6__create_order_sagas.sql`: `order_sagas`, one row per order, with the step the saga is waiting for.
+  This is the orchestrator's memory. In choreography this knowledge was spread over three databases.
+- `OrderSagaOrchestrator.start(order)`: writes the saga row in state `RESERVING_STOCK` and the
+  `ReserveStock` command. `Propagation.MANDATORY`, so it can only join `placeOrder`'s transaction.
+- `ReserveStockCommand`: `orderId`, `sku`, `quantity`. Key = order ID, topic `inventory-commands`.
+- `OutboxWriter`: extracted from `OrderService`, because two classes now write to the outbox. Inventory
+  and payment already had one.
+
+One transaction now holds the order row, `OrderCreated`, the saga row and `ReserveStock`.
+
+**`ReserveStock` carries no amount.** In choreography, `InventoryReserved` carried `customerId`,
+`totalAmount` and `currency` only for payment. Here the orchestrator owns the order data and will build
+`ChargePayment` itself. Inventory receives only what inventory needs.
+
+**`OrderCreated` stays.** It is a fact about the order and costs little. It no longer drives the saga. Until
+the next step, inventory still reacts to it, because the `ReserveStock` consumer does not exist yet.
+
+**Observed:**
+
+- Migration v6 applied. A new order: saga row `RESERVING_STOCK`, 1 record on `orders`, 1 `ReserveStock` on
+  `inventory-commands` with the order ID as key and `eventId` and `eventType` headers.
+- Forced failure: a temporary `CHECK` constraint made the saga insert fail, after `OrderCreated` had
+  already been flushed. API returned 500. The `orders` table, `order_sagas`, both topics and the outbox
+  did not change. Debezium reads only committed changes, so the flushed row never left the database.
+  The constraint was removed after the test.
+- The 2 orders from before this step have no saga row. They were test orders and are left as they are.
+
+#### Orchestration 3: inventory obeys `ReserveStock` (branch `saga-orchestration`)
+
+Inventory no longer reacts to `OrderCreated`. It reads `inventory-commands` and answers on `inventory`.
+
+- `StockCommandListener` + `StockCommandHandler` replace `OrderEventListener` + `OrderEventHandler`.
+  `OrderCreatedEvent` is gone from inventory. It no longer knows that orders exist as events.
+- In one transaction: inbox row, stock update, reservation row, reply through `OutboxWriter`.
+- The command ID is used as the inbox key, so a repeated command has no effect.
+
+| Reply | When | Payload |
+|---|---|---|
+| `StockReserved` | Conditional `UPDATE stock` matched | `orderId` |
+| `StockRejected` | No row matched | `orderId`, `reason: INSUFFICIENT_STOCK` |
+
+**Compare with choreography.** `InventoryReserved` carried `sku`, `quantity`, `customerId`, `totalAmount`
+and `currency`, because the next service read it directly. `StockReserved` carries only `orderId`.
+The reply goes to the orchestrator, which already has the order. Inventory does not know that payment
+exists, or what comes next.
+
+**A limit to remember.** If the orchestrator ever resends `ReserveStock`, it must reuse the same command
+ID. With a new ID the inbox would not catch it: stock would be taken, and the insert into `reservations`
+would then fail on the primary key, roll back, and be retried as a failing message. The orchestrator
+does not resend yet.
+
+**Observed:**
+
+- On start: `OutboxSmokeTest` ignored, the waiting `ReserveStock` of step 2 → 2 laptops reserved,
+  `StockReserved` on `inventory`.
+- Live: phone x5 → `StockRejected` with `INSUFFICIENT_STOCK`, phone x1 → `StockReserved`, both keyed by
+  order ID. Stock laptop 7/3, phone 2/1. `OrderCreated` of these orders reserved nothing.
+- Replay of `inventory-commands` from earliest: 3 duplicates, 1 ignored, stock unchanged, `inventory`
+  topic still 3 records.
+- Nobody reads the replies yet, so these sagas stay in `RESERVING_STOCK`. That is the next step.
+
+#### Orchestration 4: the orchestrator reads inventory's reply (branch `saga-orchestration`)
+
+Order-service now also consumes.
+
+- `V7__create_processed_events.sql`: the inbox. Consumer config: group `order-service`,
+  `group.protocol: consumer`, `manual_immediate` acks.
+- `InventoryReplyListener` + `InventoryReplyHandler` on `inventory`: type check, inbox, then the
+  orchestrator, all in one transaction.
+- `StockReply(orderId, reason)`: one tolerant record for both replies.
+
+| Reply | Saga state | Order status | Next |
+|---|---|---|---|
+| `StockReserved` | `RESERVING_STOCK` → `CHARGING_PAYMENT` | stays `PENDING` | `ChargePayment` on `payment-commands` |
+| `StockRejected` | `RESERVING_STOCK` → `CANCELLED` | `CANCELLED` | nothing to compensate |
+
+**The state machine is one conditional update.** `OrderSagaRepository.transition(orderId, from, to)`
+runs `UPDATE ... WHERE order_id = :orderId AND state = :from`. A reply is valid only in the state that
+expects it. 0 rows means a late or repeated reply: it is logged and changes nothing. So all flow logic
+now sits in one class, `OrderSagaOrchestrator`: reading it shows the whole saga. In choreography that
+required reading three services.
+
+**`ChargePayment` is built from the order.** `customerId`, `amount` and `currency` come from the `orders`
+table, in the same database. Inventory did not carry them.
+
+**Observed:**
+
+- On start, migration v7 applied, and the 3 waiting replies were handled:
+  - c-saga (2999.98) and c-ok (699.00): `CHARGING_PAYMENT`, order `PENDING`, `ChargePayment` with the
+    right amount, keyed by order ID.
+  - c-nostock: saga and order `CANCELLED`, order `version` 1.
+- Replay of `inventory` from earliest: 2 duplicate `StockReserved`, 1 duplicate `StockRejected`.
+- Replay again after deleting the inbox rows: 3 times "saga is not in RESERVING_STOCK, reply ignored".
+  `payment-commands` stayed at 3 records (1 smoke test + 2 commands), statuses and versions unchanged. The
+  state guard works without the inbox.
+
+#### Orchestration 5: payment obeys `ChargePayment` (branch `saga-orchestration`)
+
+Payment reads `payment-commands` and answers on `payments`.
+
+- `V3__create_payments.sql`: `payments`, one row per order, the same table as on the choreography branch
+  at this point.
+- `PaymentCommandListener` + `PaymentCommandHandler`: type check, inbox, payment row, reply, in one
+  transaction.
+- `payment.max-amount: 2000`: the same simulated gateway rule as in choreography.
+- `insertIfAbsent` (`ON CONFLICT DO NOTHING`): a second charge for one order changes nothing and sends
+  no reply.
+
+| Reply | When | Payload |
+|---|---|---|
+| `PaymentCompleted` | `amount <= payment.max-amount` | `orderId` |
+| `PaymentFailed` | Over the limit | `orderId`, `reason: AMOUNT_LIMIT_EXCEEDED` |
+
+**Compare with choreography.** Payment reads one topic and knows only `ChargePayment`. On the choreography
+branch it read `inventory` and `orders`, and had to know what `InventoryReserved` and `OrderCancelled` mean.
+Here it does not know that inventory exists. The replies also lost `amount` and `currency`: the
+orchestrator already has them.
+
+**Observed:**
+
+- On start: migration v3 applied, `OutboxSmokeTest` ignored, the 2 waiting commands handled:
+  - c-ok, 699.00 → `COMPLETED`, `PaymentCompleted`
+  - c-saga, 2999.98 → `FAILED`, `PaymentFailed` with `AMOUNT_LIMIT_EXCEEDED`
+- Both replies keyed by order ID. `outbox_events` empty.
+- Replay of `payment-commands`: 2 duplicates, 1 ignored.
+- Replay again after deleting the inbox rows: 2 times "already has a payment, not charged", 1 ignored.
+  `payments` table and topic unchanged. The primary key works as a guard without the inbox.
+- Nobody reads these replies yet, so both sagas stay in `CHARGING_PAYMENT`. c-saga's 2 laptops also stay
+  reserved. That is the next step.
+
+#### Orchestration 6: the saga ends, with compensation (branch `saga-orchestration`)
+
+Order-service now also reads `payments`. Inventory also handles `ReleaseStock`. The full state machine:
+
+```
+RESERVING_STOCK ──StockRejected──────────────────────────────► CANCELLED
+      │ StockReserved / ChargePayment
+      ▼
+CHARGING_PAYMENT ──PaymentCompleted──► COMPLETED (order CONFIRMED)
+      │ PaymentFailed / ReleaseStock
+      ▼
+RELEASING_STOCK ──StockReleased──────────────────────────────► CANCELLED
+```
+
+- `PaymentReplyListener` + `PaymentReplyHandler`, the same shape as the inventory replies.
+- `OrderSagaOrchestrator`: `onPaymentCompleted`, `onPaymentFailed`, `onStockReleased`.
+- Inventory: `ReleaseStockCommand`, `StockReleasedEvent`, and the same one-statement `release` as on the
+  choreography branch.
+
+**The order stays `PENDING` until the stock is back.** `CANCELLED` then means the compensation has
+finished. A customer who sees it can trust that nothing is held. It costs one more round trip. In
+choreography, order-service cancelled on `PaymentFailed` while inventory released on its own, so the order
+could be `CANCELLED` while the stock was still reserved.
+
+**`ReleaseStock` always gets a reply, even with nothing to release.** The orchestrator is waiting. In
+choreography a compensation could stay silent, because nobody waited for it. Here silence would leave the
+saga in `RELEASING_STOCK`. This is a new duty that commands bring.
+
+**Observed:**
+
+- Waiting replies: c-ok → `COMPLETED` / `CONFIRMED`. c-saga → `RELEASING_STOCK`, 2 laptops released, then
+  `CANCELLED`. Laptop stock 7/3 → 9/1.
+- Live: laptop x1 → `CONFIRMED`. Laptop x2 (2999.98) → `CANCELLED`, 7 steps in 3.1 s:
+  started, reserved, charging, failed, releasing, released, cancelled. Laptop 9/1 → 8/2.
+  `stock.reserved = SUM(RESERVED rows)` held for all SKUs.
+- `inventory-commands` replayed after deleting the `ReleaseStock` inbox rows: 2 releases with 0
+  reservations, stock unchanged. Each sent a new `StockReleased` with a new event ID, so the inbox could
+  not catch it. The orchestrator ignored both: "saga is not in RELEASING_STOCK".
+- Order-service replayed both reply topics: duplicates only. The fingerprint (md5) of sagas and orders
+  was the same before and after.
+
+#### Orchestration 7: timeout while reserving and releasing (branch `saga-orchestration`)
+
+`SagaTimeout`, a `@Scheduled` job (every 5 s), finds sagas that stayed in one state longer than
+`order.saga-timeout.after` (30 s). `updated_at` is reset by every transition, so the time is per step, not
+per saga. `V8__index_sagas_by_state.sql` adds an index on `(state, updated_at)`.
+
+| Stuck in | Meaning | Action |
+|---|---|---|
+| `RESERVING_STOCK` | Unknown if inventory reserved | move to `RELEASING_STOCK`, send `ReleaseStock` |
+| `RELEASING_STOCK` | Compensation not confirmed | send `ReleaseStock` again |
+| `CHARGING_PAYMENT` | Unknown if payment charged | **not handled yet**, next step |
+
+**Compare with choreography.** There the timeout knew only "this order is `PENDING`", so one
+`OrderCancelled` went to everybody, and each service had to work out what it meant. Here the saga row says
+which step is unanswered, so the orchestrator sends only the compensation that step needs.
+
+**"Release before reserve" cannot happen.** `ReleaseStock` has the same key and topic as `ReserveStock`, so
+it is in the same partition, behind it. A slow inventory reserves first and releases second. The late
+`StockReserved` finds the saga in `RELEASING_STOCK` and is ignored. In choreography payment read two
+topics, so the same race needed a marker row and an upsert. One command topic per service, keyed by order,
+removes that case.
+
+**A compensation cannot give up.** Moving forward can stop at any point, but once compensation has started
+it must finish, or stock stays locked. So `ReleaseStock` is sent again each timeout until `StockReleased`
+arrives. It uses a new command ID on purpose: the inbox would swallow the old ID and no reply would
+come. This is safe because `release` is idempotent by `status = 'RESERVED'`. The Orchestration 3 note about
+reusing the command ID applies to `ReserveStock`, which is not idempotent by itself.
+
+**Costs:**
+
+- While inventory is down, one more `ReleaseStock` is written per timeout, and the order stays `PENDING`.
+  There is no limit or backoff yet. A real system would alert after N attempts.
+- Two order-service instances could both resend. That would be harmless because of the idempotent release.
+  Not tested.
+
+**Observed** (inventory down, phone x1):
+
+- 20 s: `RESERVING_STOCK`. 40 s: `RELEASING_STOCK`. `ReleaseStock` was sent again at 60 s and 90 s.
+- `inventory-commands`: `ReserveStock`, then the `ReleaseStock`s, all in partition 0, offsets in order.
+- Inventory started: within about 75 ms it reserved 1, released 1, then released 0 twice.
+- Orchestrator: late `StockReserved` ignored, first `StockReleased` → `CANCELLED`, the other two ignored.
+- Phone stock 2/1 before and after. Order `CANCELLED`, version 1. Reservation `RELEASED`.
+
+#### Orchestration 8: timeout while charging, refund (branch `saga-orchestration`)
+
+The last unanswered state. A new state `REFUNDING_PAYMENT` and a new command `RefundPayment`:
+
+```
+CHARGING_PAYMENT ──timeout / RefundPayment──► REFUNDING_PAYMENT ──PaymentRefunded / ReleaseStock──► RELEASING_STOCK
+```
+
+- Order-service: `SagaTimeout` also checks `CHARGING_PAYMENT` and `REFUNDING_PAYMENT`. The orchestrator gets
+  `onPaymentTimeout`, `onRefundTimeout` and `onPaymentRefunded`.
+- Payment: `RefundPayment` runs `UPDATE payments SET status = 'REFUNDED' ... WHERE status = 'COMPLETED'` and
+  always replies `PaymentRefunded`. `V4__add_payment_updated_at.sql` adds `updated_at`.
+
+**Compensations run in reverse order.** The money first, then the stock. That is the rule from the original
+Sagas paper: undo the last step first. In choreography both reacted to `OrderCancelled` at the same time, with
+no order between them.
+
+**No marker row, no upsert.** On the choreography branch, the cancel could reach payment before the charge,
+so payment needed a `CANCELLED` marker row, nullable columns and `INSERT ... ON CONFLICT DO UPDATE`. Here
+`RefundPayment` is behind `ChargePayment` in one partition, so the charge has always been handled first. Refund
+is a plain conditional `UPDATE`.
+
+**A timed-out charge is an unknown, not a failure.** The orchestrator cannot tell if the money moved. So it does
+not skip to `ReleaseStock`. It asks for a refund and waits. A late `PaymentCompleted` is ignored, and the
+refund has already undone it. No saga has isolation: for a moment the customer really was charged.
+
+**Observed** (payment down, two orders: 1499.99 and 2999.98):
+
+- 15 s: both `CHARGING_PAYMENT`. 40 s: both `REFUNDING_PAYMENT`. `RefundPayment` sent again until payment
+  came back. Laptop stock 5/5 while waiting.
+- In each partition `ChargePayment` was ahead of the `RefundPayment`s.
+- Payment started:
+  - 1499.99: charged, refunded (1 row), then 2 refunds of 0 rows. Row `REFUNDED`.
+  - 2999.98: failed, then 3 refunds of 0 rows. Row `FAILED`.
+- Orchestrator: the late `PaymentCompleted` and `PaymentFailed` ignored, first `PaymentRefunded` → `RELEASING_STOCK`,
+  the others ignored, `StockReleased` → `CANCELLED`.
+- Laptop stock back to 8/2, `stock.reserved = SUM(RESERVED rows)` for all SKUs. No saga left in a
+  middle state: 6 `CANCELLED`, 2 `COMPLETED`.
+
+#### Orchestration summary and comparison (branch `saga-orchestration`)
+
+**Messages on this branch:**
+
+| Topic | Message | From | To |
+|---|---|---|---|
+| `orders` | `OrderCreated` | order | nobody in the saga |
+| `inventory-commands` | `ReserveStock`, `ReleaseStock` | orchestrator | inventory |
+| `payment-commands` | `ChargePayment`, `RefundPayment` | orchestrator | payment |
+| `inventory` | `StockReserved`, `StockRejected`, `StockReleased` | inventory | orchestrator |
+| `payments` | `PaymentCompleted`, `PaymentFailed`, `PaymentRefunded` | payment | orchestrator |
+
+**Measured comparison.** Both branches were run by the same script, each from an empty environment, on one
+laptop. 20 orders per path, one at a time, after 3 warm-up orders. Time is `orders.updated_at - created_at`.
+For the payment failure, "stock back" uses the reservation's `updated_at`.
+
+| Path | Choreography median (min-max) | Orchestration median (min-max) | Messages per order (chor / orch) |
+|---|---|---|---|
+| Success, order `CONFIRMED` | 1412 ms (1315-3864) | 1920 ms (1843-2450) | 3 / 5 |
+| No stock, order `CANCELLED` | 915 ms (723-1926) | 942 ms (823-1911) | 2 / 3 |
+| Payment failed, order `CANCELLED` | 1675 ms (1250-2204) | 3275 ms (2708-3789) | 3 / 7 |
+| Payment failed, stock back | 1677 ms (1256-2180) | 2773 ms (2208-3286) | same run |
+
+Message counts include `OrderCreated`, which no saga step reads on this branch.
+
+**Reading the numbers.** The time follows the number of hops through the outbox and CDC, at roughly 0.5 s each:
+2 hops in both for no stock, 3 vs 4 for success, 3 vs 6 for payment failure. The 0.5 s is an estimate from
+these numbers. Its cause was not measured. On a laptop with an idle system these numbers show the shape,
+not production latency, and throughput was not measured at all.
+
+In orchestration the failed order becomes `CANCELLED` 0.5 s after the stock is back. In choreography both
+happen at about the same time, but independently, so nothing guarantees the stock is back first.
+
+**Scenarios:**
+
+| # | Scenario | Choreography | Orchestration |
+|---|---|---|---|
+| 1 | laptop x1 | `CONFIRMED` | `CONFIRMED` |
+| 2 | no stock | `CANCELLED` | `CANCELLED` |
+| 3 | payment limit | `CANCELLED`, stock released | `CANCELLED`, stock released |
+| 4 | a service down | cancelled by timeout, stock released, money refunded | the same, with compensation in reverse order |
+| 5 | cancel before / after the charge | both needed code: marker row and upsert | "before" cannot happen: same partition |
+| 6 | replay | no change, per topic | no change, all topics at once |
+
+Scenarios 1-3 were run by the script on both branches. Scenarios 4 and 5 come from Choreography 5-7 and
+Orchestration 7-8. Scenario 6 on this branch: all consumer groups reset to earliest, 276 duplicates, no
+orchestrator action, and fingerprints of orders, stock, reservations and payments identical. On the
+choreography branch it was done per topic in each step.
+
+**Structure:**
+
+| | Choreography | Orchestration |
+|---|---|---|
+| Topics | 3 | 5 |
+| Message types | 6 | 11 |
+| Topics a service reads | 2 each (full mesh) | 1 for inventory and payment, 2 for order |
+| Lines added since the branch point (Java + SQL) | 869 | 1182 |
+| of which in order-service | 268 | 689 |
+| Where the flow can be read | three services | `OrderSagaOrchestrator`, 155 lines |
+| Where the state lives | three tables in three databases | `order_sagas`, one row per order |
+| Timeout | one `OrderCancelled` to everybody | per step, only the needed compensation |
+| Compensation order | none | reverse, explicit |
+| Adding shipping (thought test) | changes order, payment, inventory | changes the orchestrator, plus the new service |
+| New failure point | none | order-service: if it is down, every saga stops moving |
+
+Orchestration also added duties that did not exist before: every command needs a reply, even with nothing to do,
+and a compensation must be resent until it is confirmed.
+
+**Known limitations, on both branches:**
+
+- The timeout job has no per-saga error handling. On this branch an exception in `stuck.forEach(action)` stops
+  that run. Because the rollback keeps `updated_at`, the same saga is first again on the next run, so one bad saga can block
+  all timeouts. Choreography's `PendingOrderTimeout` has the same loop shape. Found by reading the code, not tested.
+- Resending has no limit and no backoff, and there is no state for a compensation that can never succeed.
+- Refunds are status changes, not gateway calls.
+- A consumer gives up after 10 quick attempts and drops the message. That is what retry topics and the DLT are for.
+
+**When to choose which:**
+
+- Choreography: few steps, little compensation, teams that must stay independent, and lowest latency.
+- Orchestration: many steps, real compensation, timeouts, and a need to answer "where is this order".

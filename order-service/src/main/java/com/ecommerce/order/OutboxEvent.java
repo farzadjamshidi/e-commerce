@@ -26,6 +26,9 @@ class OutboxEvent implements Persistable<UUID> {
     private Long position;
 
     @Column(nullable = false)
+    private String destination;
+
+    @Column(nullable = false)
     private String aggregateType;
 
     @Column(nullable = false)
@@ -50,10 +53,11 @@ class OutboxEvent implements Persistable<UUID> {
     protected OutboxEvent() {
     }
 
-    static OutboxEvent create(UUID eventId, String aggregateType, String aggregateId, String eventType,
-                              String payload, Instant createdAt) {
+    static OutboxEvent create(UUID eventId, String destination, String aggregateType, String aggregateId,
+                              String eventType, String payload, Instant createdAt) {
         OutboxEvent event = new OutboxEvent();
         event.id = eventId;
+        event.destination = destination;
         event.aggregateType = aggregateType;
         event.aggregateId = aggregateId;
         event.eventType = eventType;
@@ -73,6 +77,7 @@ class OutboxEvent implements Persistable<UUID> {
     void markNotNew() { isNew = false; }
 
     Long getPosition() { return position; }
+    String getDestination() { return destination; }
     String getAggregateType() { return aggregateType; }
     String getAggregateId() { return aggregateId; }
     String getEventType() { return eventType; }

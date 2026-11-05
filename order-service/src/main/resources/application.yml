@@ -26,9 +26,25 @@ spring:
         "[linger.ms]": 5
         "[delivery.timeout.ms]": 120000
         "[request.timeout.ms]": 30000
+    consumer:
+      group-id: order-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        "[group.protocol]": consumer
+    listener:
+      ack-mode: manual_immediate
 
 outbox:
   relay:
     enabled: false
     poll-interval-ms: 500
+    batch-size: 100
+
+order:
+  saga-timeout:
+    # A healthy step takes under a second; a saga still waiting after this is treated as stuck
+    after: 30s
+    check-interval-ms: 5000
     batch-size: 100
