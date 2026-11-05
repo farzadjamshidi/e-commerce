@@ -2086,4 +2086,46 @@ case by case. It is not an automatic second queue.
 - `setCommitRecovered`: a broken record as the last in its partition. Offset 3 of 3, lag 0, with no later ack to
   move it. A plain restart earlier left the DLT unchanged.
 
-Order-service and payment still have the old behavior. They are the next step.
+## Failure handling 2: retry and a DLT for payment and order-service
+
+The same `KafkaErrorConfig` now runs in payment and order-service, with the same backoff and the same non-retryable
+exceptions. `infra/setup.sh topics` creates the missing DLTs, each with 3 partitions:
+
+| Service | Listens to | DLT |
+|---|---|---|
+| inventory | `inventory-commands` | `inventory-commands-dlt` |
+| payment | `payment-commands` | `payment-commands-dlt` |
+| order-service | `inventory` | `inventory-dlt` |
+| order-service | `payments` | `payments-dlt` |
+
+Order-service has two listeners and one error handler. The DLT name comes from the record's topic, so one bean is
+enough. The class is copied three times, because the services share no code. That is a deliberate choice: a shared
+library would couple their releases for 20 lines.
+
+**A lost reply is worse than a lost command.** A command in the DLT means the work was not done. A reply in the DLT
+means the work was done and order-service does not know. `PaymentCompleted` in `payments-dlt` means the customer paid
+for an order that looks unpaid. The timeout covers this too, because it does not need to know what happened: it
+refunds, and the refund works on what the payment row says.
+
+| Lost message | State after the DLT | What the timeout did |
+|---|---|---|
+| `ChargePayment` | no payment, stock reserved | sent a refund with nothing to refund, released the stock |
+| `StockReserved` | stock reserved, saga still `RESERVING_STOCK` | released the stock |
+| `PaymentCompleted` | money taken, saga still `CHARGING_PAYMENT` | refunded, released the stock |
+
+So a retry and a DLT protect the partition, and the saga timeout protects the customer.
+
+**Known limitation:** a `RefundPayment` or `ReleaseStock` that always fails goes to the DLT, the timeout sends a new
+one, and that goes to the DLT too, every 30 s or so. The order stays open and the DLT grows. This was found by reading
+the code, not tested. It is the same gap as the timeout job limitation above, and it needs an alert (Phase 4).
+
+**Observed:** temporary `CHECK` constraints caused the failures, and all of them were removed afterwards.
+
+- Broken payloads on `payment-commands`, `inventory` and `payments`, and a bad UUID in the `eventId` header: each
+  reached its DLT in under 3 s including tool startup, well inside the 7 s of retries.
+- Failures that heal, in payment and in order-service: attempts at 0 and 1 s failed, the one at 3 s succeeded. The
+  order was `CONFIRMED`, nothing on a DLT.
+- Failures that do not heal, in both services: attempts at 0, 1, 3 and 7 s, then the DLT.
+- The three lost messages in the table above: each order ended `CANCELLED` with its stock back. For the lost
+  `PaymentCompleted` the payment went from `COMPLETED` to `REFUNDED`.
+- `setCommitRecovered`: a broken record as the last in its partition, on all three topics. Lag 0.
