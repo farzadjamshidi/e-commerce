@@ -1800,3 +1800,37 @@ table, in the same database. Inventory did not carry them.
 - Replay again after deleting the inbox rows: 3 times "saga is not in RESERVING_STOCK, reply ignored".
   `payment-commands` stayed at 3 records (1 smoke test + 2 commands), statuses and versions unchanged. The
   state guard works without the inbox.
+
+#### Orchestration 5: payment obeys `ChargePayment` (branch `saga-orchestration`)
+
+Payment reads `payment-commands` and answers on `payments`.
+
+- `V3__create_payments.sql`: `payments`, one row per order, the same table as on the choreography branch
+  at this point.
+- `PaymentCommandListener` + `PaymentCommandHandler`: type check, inbox, payment row, reply, in one
+  transaction.
+- `payment.max-amount: 2000`: the same simulated gateway rule as in choreography.
+- `insertIfAbsent` (`ON CONFLICT DO NOTHING`): a second charge for one order changes nothing and sends
+  no reply.
+
+| Reply | When | Payload |
+|---|---|---|
+| `PaymentCompleted` | `amount <= payment.max-amount` | `orderId` |
+| `PaymentFailed` | Over the limit | `orderId`, `reason: AMOUNT_LIMIT_EXCEEDED` |
+
+**Compare with choreography.** Payment reads one topic and knows only `ChargePayment`. On the choreography
+branch it read `inventory` and `orders`, and had to know what `InventoryReserved` and `OrderCancelled` mean.
+Here it does not know that inventory exists. The replies also lost `amount` and `currency`: the
+orchestrator already has them.
+
+**Observed:**
+
+- On start: migration v3 applied, `OutboxSmokeTest` ignored, the 2 waiting commands handled:
+  - c-ok, 699.00 → `COMPLETED`, `PaymentCompleted`
+  - c-saga, 2999.98 → `FAILED`, `PaymentFailed` with `AMOUNT_LIMIT_EXCEEDED`
+- Both replies keyed by order ID. `outbox_events` empty.
+- Replay of `payment-commands`: 2 duplicates, 1 ignored.
+- Replay again after deleting the inbox rows: 2 times "already has a payment, not charged", 1 ignored.
+  `payments` table and topic unchanged. The primary key works as a guard without the inbox.
+- Nobody reads these replies yet, so both sagas stay in `CHARGING_PAYMENT`. c-saga's 2 laptops also stay
+  reserved. That is the next step.
