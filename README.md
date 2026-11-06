@@ -2161,3 +2161,26 @@ disappears exactly when lag starts to grow. Lag has to be measured from outside 
   `success` 1, which is the DLT publish. No HTTP or Kafka code was written for either.
 - The per-partition `records_lag` metric did not appear, only `lag_max`. The reason was not investigated.
 
+## Monitoring 2: metrics from payment and order-service
+
+The same metrics now come from every service, so Prometheus has three targets to read:
+
+| Service | Port | Note |
+|---|---|---|
+| order-service | 8081 | already had an HTTP server |
+| inventory | 8082 | |
+| payment | 8084 | got an HTTP server in this step; 8083 is Kafka Connect |
+
+**Order-service has two consumers.** Each `@KafkaListener` gets its own Kafka consumer, so metrics appear twice, with
+`client_id` `consumer-order-service-1` and `-2`. Queries must sum over them.
+
+**Listener names are poor.** A failure shows up as `KafkaListenerEndpointContainer#1-0`, which does not say the topic.
+An `id` on `@KafkaListener` would fix that. It was left for the step that builds the dashboard.
+
+**Observed:**
+
+- `/actuator/health` was `UP` on all three ports, and the saga finished `CONFIRMED` with metrics on.
+- A `not-json` reply on `payments` and a `not-json` command on `payment-commands`: each service showed listener
+  `failure` 1 with `StreamReadException`, and `spring_kafka_template_seconds` `success` 1 for the DLT publish.
+- `/actuator/env` returned 404, so only the listed endpoints are open.
+

@@ -48,3 +48,9 @@ order:
     after: 30s
     check-interval-ms: 5000
     batch-size: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus

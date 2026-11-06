@@ -1,3 +1,6 @@
+server:
+  port: 8084
+
 spring:
   application:
     name: payment-service
@@ -23,3 +26,9 @@ spring:
 payment:
   # Simulated gateway: orders above this amount are declined
   max-amount: 2000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
