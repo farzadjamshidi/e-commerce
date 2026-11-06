@@ -2253,3 +2253,42 @@ offsets. So "no members" cannot be an alert here, and `up` covers that case.
 Payment came back and caught up before the 30 s saga timeout, so all three orders ended `CONFIRMED`. The commands had
 waited in Kafka, which is the point of a log: an outage of the consumer becomes lag, not lost work.
 
+## Monitoring 5: alert rules
+
+`infra/prometheus/alerts.yml` holds three rules. They can be seen at `http://localhost:9090/alerts`.
+
+| Alert | Condition | Answers |
+|---|---|---|
+| `TargetDown` | `up == 0` for 15 s | is a service dead? |
+| `ConsumerLag` | total lag above 0 for 30 s | is a group falling behind? |
+| `DeadLetter` | a DLT grew in the last 5 min | does a human need to decide something? |
+
+The three cover each other. Lag alone misses a dead service with no traffic, and `up` alone misses a live service that
+is stuck. A record on a DLT shows neither, because the consumer moved on and lag is 0.
+
+**States:** an alert is `pending` while its `for` is running, then `firing`. `for` stops a short spike from waking
+anyone. A DLT record is not a spike, so `DeadLetter` has no `for`.
+
+**`evaluation_interval` matters.** The first test used the default of 1 minute, so the alerts were still `pending`
+80 s after the failure, even after the service came back. Detection time is scrape interval, plus evaluation interval,
+plus `for`. It is now 5 s.
+
+**`DeadLetter` is an event, not a state.** It clears after 5 min, while the record is still on the DLT. So it says
+"something new arrived", not "the DLT is empty". A real team would track each record until someone decides.
+
+**Firing is not notifying.** Prometheus only decides that an alert is active. Sending it to Slack or a pager, grouping
+and silencing is the job of Alertmanager, which is not installed here.
+
+`ConsumerLag` uses a threshold of 0 because this project has almost no traffic. On a busy topic a healthy lag is above
+0 all the time, so the threshold has to come from that topic's normal behavior.
+
+**Observed:**
+
+- All healthy: no `TargetDown` or `ConsumerLag`.
+- Payment killed and one order sent: `TargetDown` was `firing` at about 25 s, `ConsumerLag` was `firing` by 49 s. The
+  saga timeout passed while payment was down, so after the restart the order was `CANCELLED` and the payment
+  `REFUNDED`. Both alerts cleared within seconds of the restart catching up.
+- A `not-json` command on `payment-commands`: `DeadLetter` for `payment-commands-dlt` was `firing` within 9 s. It
+  cleared at about 305 s with the record still on the DLT.
+- `ConsumerLag` did not fire for a short lag: on `inventory-commands` it went `pending` and cleared within seconds.
+

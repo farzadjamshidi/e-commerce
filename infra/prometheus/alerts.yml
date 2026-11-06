@@ -1,0 +1,27 @@
+groups:
+  - name: kafka-saga
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} cannot be scraped"
+
+      # Short lag is normal, so it must last. The right threshold depends on the topic's traffic.
+      - alert: ConsumerLag
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.consumergroup }} is behind on {{ $labels.topic }} by {{ $value }} records"
+
+      # No `for`: one record on a DLT already needs a human
+      - alert: DeadLetter
+        expr: sum by (topic) (increase(kafka_topic_partition_current_offset{topic=~".+-dlt"}[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "New records on {{ $labels.topic }}"
