@@ -22,7 +22,7 @@ class PaymentReplyListener {
         this.paymentReplyHandler = paymentReplyHandler;
     }
 
-    @KafkaListener(topics = "payments")
+    @KafkaListener(id = "payment-replies", idIsGroup = false, topics = "payments")
     void onPaymentReply(ConsumerRecord<String, String> record, Acknowledgment ack) {
         String eventId = header(record, "eventId");
         if (eventId == null) {

@@ -22,7 +22,7 @@ class InventoryReplyListener {
         this.inventoryReplyHandler = inventoryReplyHandler;
     }
 
-    @KafkaListener(topics = "inventory")
+    @KafkaListener(id = "inventory-replies", idIsGroup = false, topics = "inventory")
     void onInventoryReply(ConsumerRecord<String, String> record, Acknowledgment ack) {
         String eventId = header(record, "eventId");
         if (eventId == null) {

@@ -2292,3 +2292,34 @@ and silencing is the job of Alertmanager, which is not installed here.
   cleared at about 305 s with the record still on the DLT.
 - `ConsumerLag` did not fire for a short lag: on `inventory-commands` it went `pending` and cleared within seconds.
 
+## Monitoring 6: a Grafana dashboard
+
+Grafana runs in Docker Compose on port 3000. The dashboard is at `http://localhost:3000/d/kafka-saga`, and viewing it
+needs no login. Grafana stores no metrics, it only asks Prometheus.
+
+Everything is provisioned from files in `infra/grafana`: the data source and the dashboard JSON. A recreated container
+gets the same dashboard, and a change to it shows up in a Git diff. Edits made in the UI are not kept in the repo.
+
+| Panel | Question |
+|---|---|
+| Targets | who is up? |
+| Lag by group and topic | who is falling behind? |
+| Records consumed per second | is work moving? |
+| Listener failures since service start | what is failing, and with which exception? |
+| New DLT records in 5 min | what needs a human? |
+
+**Listener names.** Each `@KafkaListener` now has an `id`, so a failure says `payment-replies-0` and not
+`KafkaListenerEndpointContainer#1-0`. `idIsGroup = false` is required. By default the `id` replaces the group id, which
+would create a new group with no committed offsets. With `auto-offset-reset: earliest` that group would read every
+topic from the start. After the change the groups were still `inventory-service`, `order-service` and
+`payment-service`.
+
+**`rate` missed single failures.** The first version of the failures panel used `rate`, and it showed 0 after three
+real failures. A counter with these labels does not exist until the first failure, so Prometheus first sees it at 1
+and has no earlier sample to compare with. The panel now shows the raw count. `DeadLetter` does not have this problem,
+because the end offset of a DLT partition exists before any record arrives.
+
+**Observed:** seven orders and three broken messages. All panels showed data, checked with queries through Grafana and
+with a screenshot of the page. All targets `UP`, a short lag of 1 on `payments`, DLT panels at 1 on the three topics
+used, and failures named `inventory-replies-0`, `payment-replies-0` and `stock-commands-0`.
+

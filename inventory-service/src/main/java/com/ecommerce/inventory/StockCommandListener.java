@@ -26,7 +26,7 @@ class StockCommandListener {
         this.processingDelayMs = processingDelayMs;
     }
 
-    @KafkaListener(topics = "inventory-commands")
+    @KafkaListener(id = "stock-commands", idIsGroup = false, topics = "inventory-commands")
     void onStockCommand(ConsumerRecord<String, String> record, Acknowledgment ack) throws InterruptedException {
         Thread.sleep(processingDelayMs);
         String eventId = header(record, "eventId");

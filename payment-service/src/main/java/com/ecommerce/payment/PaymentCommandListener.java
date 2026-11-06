@@ -22,7 +22,7 @@ class PaymentCommandListener {
         this.paymentCommandHandler = paymentCommandHandler;
     }
 
-    @KafkaListener(topics = "payment-commands")
+    @KafkaListener(id = "payment-commands", idIsGroup = false, topics = "payment-commands")
     void onPaymentCommand(ConsumerRecord<String, String> record, Acknowledgment ack) {
         String eventId = header(record, "eventId");
         if (eventId == null) {
