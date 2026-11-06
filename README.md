@@ -2129,3 +2129,35 @@ the code, not tested. It is the same gap as the timeout job limitation above, an
 - The three lost messages in the table above: each order ended `CANCELLED` with its stock back. For the lost
   `PaymentCompleted` the payment went from `COMPLETED` to `REFUNDED`.
 - `setCommitRecovered`: a broken record as the last in its partition, on all three topics. Lag 0.
+
+## Monitoring 1: metrics from inventory
+
+Phase 4 starts with visibility, because nobody sees a DLT fill up today. This step only exposes raw metrics from one
+service. Prometheus and Grafana come later.
+
+- `spring-boot-starter-actuator` and `micrometer-registry-prometheus` add `/actuator/prometheus`, the text format
+  Prometheus reads.
+- `spring-boot-starter-webmvc` was added too, because inventory had no HTTP server. It now listens on port 8082.
+- Only `health` and `prometheus` are exposed. Actuator endpoints can leak internals, so the list is explicit.
+
+Spring Boot connects the Kafka clients to Micrometer by itself, so no Kafka metric needed code:
+
+| Metric | Meaning |
+|---|---|
+| `kafka_consumer_fetch_manager_records_consumed_total` | records read by this consumer |
+| `kafka_consumer_fetch_manager_records_lag_max` | the largest lag this consumer sees |
+| `kafka_consumer_coordinator_rebalance_total` | rebalances so far |
+| `spring_kafka_listener_seconds` | listener calls and their time, with `result` and `exception` tags |
+| `spring_kafka_template_seconds` | sends through `KafkaTemplate`, which includes DLT publishing |
+
+**Client metrics are not enough for lag.** This one comes from inside the consumer. If the service dies, the metric
+disappears exactly when lag starts to grow. Lag has to be measured from outside too, from the offsets on the broker.
+
+**Observed:**
+
+- `/actuator/health` returned `UP`, and `/actuator/prometheus` returned 97 metric families starting with `kafka_`.
+- One order: `records_consumed_total` 1 (its `ReserveStock`), listener `success` 1, `lag_max` 0.
+- One `not-json` command: listener `failure` 1 with `exception="StreamReadException"`, and `spring_kafka_template_seconds`
+  `success` 1, which is the DLT publish. No HTTP or Kafka code was written for either.
+- The per-partition `records_lag` metric did not appear, only `lag_max`. The reason was not investigated.
+

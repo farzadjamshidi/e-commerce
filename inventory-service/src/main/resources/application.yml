@@ -1,3 +1,6 @@
+server:
+  port: 8082
+
 spring:
   application:
     name: inventory-service
@@ -19,3 +22,9 @@ spring:
         "[group.protocol]": consumer
     listener:
       ack-mode: manual_immediate
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
