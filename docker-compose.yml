@@ -88,5 +88,13 @@ services:
       - kafka-3
       - postgres
 
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
 volumes:
   postgres-data:

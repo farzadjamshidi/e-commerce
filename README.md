@@ -2184,3 +2184,35 @@ An `id` on `@KafkaListener` would fix that. It was left for the step that builds
   `failure` 1 with `StreamReadException`, and `spring_kafka_template_seconds` `success` 1 for the DLT publish.
 - `/actuator/env` returned 404, so only the listed endpoints are open.
 
+## Monitoring 3: Prometheus reads the services
+
+Prometheus runs in Docker Compose on port 9090, with its config in `infra/prometheus/prometheus.yml`. It reads
+`/actuator/prometheus` from each service every 5 s. Each service is its own `job`, so queries can group by service.
+
+The services run on the host, so the targets use `host.docker.internal`, the name a Docker Desktop container uses to
+reach the host. Prometheus has no volume, so its history is lost when the container is recreated. That is fine for
+practice.
+
+**Pull, not push.** Prometheus goes to the services. The result is a free health signal: every scrape writes an `up`
+series, 1 or 0. A service that pushes its metrics and then dies simply goes quiet.
+
+Queries used in this step:
+
+```promql
+up
+sum by (job) (rate(kafka_consumer_fetch_manager_records_consumed_total[1m]))
+max by (job) (kafka_consumer_fetch_manager_records_lag_max)
+```
+
+`rate` is the per-second speed of a counter over the window, and it handles a counter going back to 0 after a restart.
+A raw counter only grows, so it says little alone.
+
+**Observed:**
+
+- All three targets were `up`.
+- Five orders for `phone-x` with 3 in stock: 3 confirmed and 2 rejected. The counters matched the saga exactly:
+  inventory 5 commands, payment 3 commands, order-service 8 replies.
+- Payment killed: `up` went to 0 for `payment-service`, and its lag series disappeared from the query. It did not show
+  0 or a growing number. So an alert on this metric would stay silent exactly when the consumer is gone. This confirms
+  the warning from Monitoring 1, and the next step measures lag from outside.
+

@@ -1,0 +1,18 @@
+global:
+  # Short for a practice project, so a test shows up quickly; production usually uses 15s to 60s
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: order-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      # The services run on the host, and this name is how a Docker Desktop container reaches it
+      - targets: ["host.docker.internal:8081"]
+  - job_name: inventory-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8082"]
+  - job_name: payment-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8084"]
