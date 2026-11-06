@@ -2346,3 +2346,21 @@ Order-service got `spring-boot-starter-opentelemetry`, and the rest is configura
 - Noise: Prometheus scrapes (`http get /actuator/prometheus`) and the saga timeout job
   (`task sagaTimeout.checkStuckSagas`) each create a trace. At sampling 1.0 they outnumber real orders.
 
+## Tracing 2: all services, and the chain breaks
+
+Inventory and payment got the same OpenTelemetry starter and configuration. `spring.kafka.listener.observation-enabled`
+is now on in all three services, because spring-kafka has the instrumentation but leaves it off by default.
+
+Every listener call now creates a span. The result shows the problem this phase has to solve.
+
+**One order, five separate traces.** A successful order produced `http post /orders`, then one trace per consumed
+message: `inventory-commands process`, `inventory process`, `payment-commands process`, `payments process`. Each has its
+own `traceId` and a single span.
+
+**Why it breaks.** The listener looks for a `traceparent` header and finds none, so it starts a new trace. No one set
+that header, because the sender did not use `KafkaTemplate`. It wrote an outbox row, and Debezium produced the Kafka
+record in another process, where the context of the original thread does not exist.
+
+So instrumenting every service is not enough. A trace is only as continuous as the path its context can travel, and the
+next step carries it through the outbox.
+

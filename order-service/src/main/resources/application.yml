@@ -35,6 +35,7 @@ spring:
         "[group.protocol]": consumer
     listener:
       ack-mode: manual_immediate
+      observation-enabled: true
 
 outbox:
   relay:
