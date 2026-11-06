@@ -127,5 +127,12 @@ services:
     depends_on:
       - prometheus
 
+  jaeger:
+    image: jaegertracing/jaeger:2.9.0
+    container_name: jaeger
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
 volumes:
   postgres-data:

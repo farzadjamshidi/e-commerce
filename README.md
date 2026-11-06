@@ -2323,3 +2323,26 @@ because the end offset of a DLT partition exists before any record arrives.
 with a screenshot of the page. All targets `UP`, a short lag of 1 on `payments`, DLT panels at 1 on the three topics
 used, and failures named `inventory-replies-0`, `payment-replies-0` and `stock-commands-0`.
 
+## Tracing 1: Jaeger and a first trace
+
+Metrics describe the whole system. A trace describes one request: a tree of spans that share a `traceId`. Each span is
+a piece of work with a start, an end and a parent.
+
+Jaeger runs in Docker Compose. Its UI is at `http://localhost:16686`, and it receives spans over OTLP on port 4318. It
+keeps them in memory, so a restart empties it. Services depend on OpenTelemetry and not on Jaeger, so the backend can
+change without touching their code. Traces are pushed, unlike Prometheus metrics.
+
+Order-service got `spring-boot-starter-opentelemetry`, and the rest is configuration:
+
+- `management.opentelemetry.tracing.export.otlp.endpoint` is where spans go.
+- `management.tracing.sampling.probability: 1.0` keeps every request. The default is 0.1. Sampling is a cost decision:
+  a busy system cannot keep every trace, so it keeps a share of them.
+
+**Observed:**
+
+- One `POST /orders`: a trace with one span, `http post /orders`, 87 ms.
+- The saga finished, but its Kafka replies created no spans. Listeners are not observed yet, so this trace ends when
+  the HTTP response is sent, while the order is still `PENDING`.
+- Noise: Prometheus scrapes (`http get /actuator/prometheus`) and the saga timeout job
+  (`task sagaTimeout.checkStuckSagas`) each create a trace. At sampling 1.0 they outnumber real orders.
+
