@@ -2216,3 +2216,40 @@ A raw counter only grows, so it says little alone.
   0 or a growing number. So an alert on this metric would stay silent exactly when the consumer is gone. This confirms
   the warning from Monitoring 1, and the next step measures lag from outside.
 
+## Monitoring 4: lag from outside the consumer
+
+`kafka-exporter` runs in Docker Compose on port 9308, and Prometheus reads it as a fourth target. It asks the brokers
+for two numbers per partition, the end of the log and the group's committed offset. Lag is the difference:
+
+```text
+lag = log end offset - committed offset
+```
+
+Neither number needs the consumer to be alive, so this lag keeps working when the service is down. That closes the gap
+found in Monitoring 3.
+
+```promql
+sum by (consumergroup, topic) (kafka_consumergroup_lag)
+```
+
+**Lag counts records, not time.** A lag of 1000 is nothing on a fast topic and a disaster on a slow one. It also says
+nothing about a consumer that is alive and stuck on a record, until the records behind it pile up. Its trend matters
+more than one number.
+
+**Do not trust `kafka_consumergroup_members` here.** It showed 0 for all three services while they were running, and 1
+for `connect-cluster`. The likely reason is that our consumers use `group.protocol=consumer`, the new protocol, and
+the exporter asks with the old describe call. This reason was not verified. Lag is correct, because it only needs
+offsets. So "no members" cannot be an alert here, and `up` covers that case.
+
+**Observed**, with payment killed and 3 orders sent:
+
+| Signal | Payment dead | After restart |
+|---|---|---|
+| Exporter lag on `payment-commands` | 3 (1 on partition 0, 2 on partition 2) | 0 |
+| Client `lag_max` for payment | series gone | not checked |
+| `up` for payment | 0 | not checked |
+| `kafka_consumergroup_members` | 0 | 0 (wrong) |
+
+Payment came back and caught up before the 30 s saga timeout, so all three orders ended `CONFIRMED`. The commands had
+waited in Kafka, which is the point of a log: an outage of the consumer becomes lag, not lost work.
+

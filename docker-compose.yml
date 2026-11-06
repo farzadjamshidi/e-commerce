@@ -88,6 +88,21 @@ services:
       - kafka-3
       - postgres
 
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: kafka-exporter
+    command:
+      - --kafka.server=kafka-1:9092
+      - --kafka.server=kafka-2:9092
+      - --kafka.server=kafka-3:9092
+    restart: on-failure
+    ports:
+      - "9308:9308"
+    depends_on:
+      - kafka-1
+      - kafka-2
+      - kafka-3
+
   prometheus:
     image: prom/prometheus:v3.5.0
     container_name: prometheus

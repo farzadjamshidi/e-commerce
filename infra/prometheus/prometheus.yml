@@ -16,3 +16,7 @@ scrape_configs:
     metrics_path: /actuator/prometheus
     static_configs:
       - targets: ["host.docker.internal:8084"]
+  # Lag from the broker's offsets, so it keeps working when a consumer dies
+  - job_name: kafka-exporter
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
