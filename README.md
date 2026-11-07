@@ -2364,3 +2364,39 @@ record in another process, where the context of the original thread does not exi
 So instrumenting every service is not enough. A trace is only as continuous as the path its context can travel, and the
 next step carries it through the outbox.
 
+## Tracing 3: the trace crosses the outbox
+
+The context now travels the same way as the message: through the database.
+
+1. `OutboxWriter` reads the current span and asks the `Propagator` for its W3C `traceparent`.
+2. The value goes into a new `outbox_events.traceparent` column, in the same transaction as the business change.
+3. Debezium copies the column to a Kafka header, with `traceparent:header:traceparent` in
+   `table.fields.additional.placement`.
+4. The listener observation finds the header and makes its span a child of the sender's span. No listener code changed.
+
+This is the outbox rule again: whatever must travel with a message has to be committed with it. The `Propagator`
+is used instead of building the string by hand, so the format stays in one place.
+
+**Deployment order matters.** The migration has to run before the connector config changes. `infra/setup.sh connectors`
+updates a running connector, so no reset was needed.
+
+**A row with no context still works.** A row with `traceparent` null reached order-service, was ignored as expected,
+and nothing went to a DLT. So rows written before the migration are harmless. They simply start a new trace.
+
+**What the trace shows now.** Successful order, one trace, each span a child of the one before it:
+
+| Start | Service | Span | Time |
+|---|---|---|---|
+| 0 ms | order | `http post /orders` | 83 ms |
+| 904 ms | inventory | `inventory-commands process` | 67 ms |
+| 1509 ms | order | `inventory process` | 30 ms |
+| 1859 ms | payment | `payment-commands process` | 71 ms |
+| 2424 ms | order | `payments process` | 21 ms |
+
+Work inside the services was about 270 ms of 2.4 s. The rest is the gaps between spans, which hold the transaction
+commit, Debezium and Kafka. This is one order, and the gaps cannot be split further, because Debezium has no span here.
+
+**Observed:** a failed payment gave one trace of 7 spans, with the compensation (`ReleaseStock` and `StockReleased`) in
+the same tree. Before this step it would have been 7 traces. The timeout path is not covered: the scheduler has no
+order context, which is the next step.
+

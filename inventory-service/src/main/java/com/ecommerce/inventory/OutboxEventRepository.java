@@ -10,9 +10,11 @@ interface OutboxEventRepository extends Repository<OutboxEvent, UUID> {
 
     @Modifying
     @Query(value = """
-            INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload)
-            VALUES (:id, :aggregateType, :aggregateId, :eventType, CAST(:payload AS jsonb))""", nativeQuery = true)
-    void insert(UUID id, String aggregateType, String aggregateId, String eventType, String payload);
+            INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload, traceparent)
+            VALUES (:id, :aggregateType, :aggregateId, :eventType, CAST(:payload AS jsonb), :traceparent)""",
+            nativeQuery = true)
+    void insert(UUID id, String aggregateType, String aggregateId, String eventType, String payload,
+                String traceparent);
 
     @Modifying
     @Query(value = "DELETE FROM outbox_events WHERE id = :id", nativeQuery = true)

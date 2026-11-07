@@ -46,6 +46,8 @@ class OutboxEvent implements Persistable<UUID> {
 
     private Instant publishedAt;
 
+    private String traceparent;
+
     // The id is preset, so Spring Data cannot tell a new event from a stored one by itself
     @Transient
     private boolean isNew = true;
@@ -54,7 +56,7 @@ class OutboxEvent implements Persistable<UUID> {
     }
 
     static OutboxEvent create(UUID eventId, String destination, String aggregateType, String aggregateId,
-                              String eventType, String payload, Instant createdAt) {
+                              String eventType, String payload, Instant createdAt, String traceparent) {
         OutboxEvent event = new OutboxEvent();
         event.id = eventId;
         event.destination = destination;
@@ -63,6 +65,7 @@ class OutboxEvent implements Persistable<UUID> {
         event.eventType = eventType;
         event.payload = payload;
         event.createdAt = createdAt;
+        event.traceparent = traceparent;
         return event;
     }
 

@@ -34,6 +34,8 @@ class OutboxEvent {
     @Column(nullable = false)
     private Instant createdAt;
 
+    private String traceparent;
+
     protected OutboxEvent() {
     }
 }
