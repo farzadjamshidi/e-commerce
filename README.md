@@ -2488,3 +2488,21 @@ In the normal flow this cannot happen. Both commands have the order id as key an
 sends the refund only after the charge. But it can happen when a `ChargePayment` is replayed by hand from
 `payment-commands-dlt` after the saga gave up. The experiment was not kept as a test, because it would assert the bug.
 
+## Fix: a charge after its refund takes no money
+
+Written test first. `chargeAfterRefundTakesNoMoney` sends `RefundPayment` and then `ChargePayment` for one order. It
+failed with `COMPLETED`, which was the bug from Testing 2, and passes after this change.
+
+- `voided_orders` (migration `V6`) holds every order the saga asked to refund.
+- A refund always inserts its order there, whether or not it found a payment. A refund means the order is over.
+- A charge first checks that table. For a voided order it takes no money and sends no reply.
+
+**Why a separate table.** A refund carries only the order id, and `payments` needs an amount, a currency and a
+customer. Making those columns nullable would weaken every real payment row to cover one rare case.
+
+**Why no reply.** The saga that sent the refund has already finished, so nobody waits for this charge. A reply would
+also be harmless, since the state machine ignores a reply it does not expect.
+
+**Why the check cannot race.** Check and insert are two statements. They are safe only because both commands of an
+order have the same key and are handled one after the other in one partition. The comment in the code says so.
+

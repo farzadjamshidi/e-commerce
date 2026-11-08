@@ -18,15 +18,17 @@ class PaymentCommandHandler {
 
     private final ProcessedEventRepository processedEventRepository;
     private final PaymentRepository paymentRepository;
+    private final VoidedOrderRepository voidedOrderRepository;
     private final OutboxWriter outboxWriter;
     private final JsonMapper jsonMapper;
     private final BigDecimal maxAmount;
 
     PaymentCommandHandler(ProcessedEventRepository processedEventRepository, PaymentRepository paymentRepository,
-                          OutboxWriter outboxWriter, JsonMapper jsonMapper,
+                          VoidedOrderRepository voidedOrderRepository, OutboxWriter outboxWriter, JsonMapper jsonMapper,
                           @Value("${payment.max-amount}") BigDecimal maxAmount) {
         this.processedEventRepository = processedEventRepository;
         this.paymentRepository = paymentRepository;
+        this.voidedOrderRepository = voidedOrderRepository;
         this.outboxWriter = outboxWriter;
         this.jsonMapper = jsonMapper;
         this.maxAmount = maxAmount;
@@ -52,6 +54,12 @@ class PaymentCommandHandler {
 
     private void charge(ChargePaymentCommand command) {
         String orderId = command.orderId().toString();
+        // No reply: the saga that sent the refund is already over, so nobody waits for this charge.
+        // Check and insert cannot race, because both commands of an order are handled in one partition.
+        if (voidedOrderRepository.existsByOrderId(command.orderId())) {
+            log.warn("Order {} was refunded before this charge arrived, not charged", orderId);
+            return;
+        }
         // Simulated gateway: a deterministic rule makes the failure path easy to trigger
         boolean approved = command.amount().compareTo(maxAmount) <= 0;
         String reason = approved ? null : PaymentFailedEvent.AMOUNT_LIMIT_EXCEEDED;
@@ -77,6 +85,7 @@ class PaymentCommandHandler {
     // ChargePayment, so the charge was already handled here, and a failed one simply has nothing to give back.
     private void refund(RefundPaymentCommand command) {
         int refunded = paymentRepository.refund(command.orderId());
+        voidedOrderRepository.insert(command.orderId());
         PaymentRefundedEvent reply = PaymentRefundedEvent.from(command);
         outboxWriter.write(reply.eventId(), AGGREGATE_TYPE, command.orderId().toString(), reply.eventType(), reply);
         log.info("Refund for order {}: {} payment refunded", command.orderId(), refunded);

@@ -84,6 +84,19 @@ class PaymentCommandIntegrationTest {
         assertThat(paymentStatus(orderId)).isNull();
     }
 
+    // Cannot happen in the normal flow, where both commands share a partition and the refund comes second.
+    // It can when a ChargePayment is replayed by hand from the DLT after the saga gave up.
+    @Test
+    void chargeAfterRefundTakesNoMoney() throws Exception {
+        UUID orderId = UUID.randomUUID();
+
+        sendRefund(orderId);
+        sendCharge(orderId, "100.00");
+
+        awaitAllHandled();
+        assertThat(paymentStatus(orderId)).isNull();
+    }
+
     private void sendCharge(UUID orderId, String amount) {
         send(orderId, ChargePaymentCommand.TYPE, """
                 {"orderId":"%s","customerId":"test","amount":%s,"currency":"EUR"}""".formatted(orderId, amount));
