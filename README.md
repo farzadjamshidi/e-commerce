@@ -2539,3 +2539,33 @@ Replies with a new id for the same step are real. A timeout resends `ReleaseStoc
 id, and each one gets its own `StockReleased` or `PaymentRefunded`. The test uses `StockReserved` because it is the
 shortest path to show the guard.
 
+## Schemas 1: Schema Registry
+
+Confluent Schema Registry runs in Docker Compose, on host port 8085 because 8081 is order-service. It keeps every
+schema in the compacted Kafka topic `_schemas`, so it has no database of its own. It creates that topic itself, with
+replication factor 3.
+
+**Where the schema is enforced in this project.** The services do not produce to Kafka, Debezium does. Three options:
+
+| Option | Who registers the schema | Problem |
+|---|---|---|
+| Avro converter in Debezium | Debezium, from a schema guessed per message with `table.expand.json.payload` | the contract is inferred from data, not designed; a `null` or a whole number gives a new version |
+| Serialize in the service | the service, when it writes the outbox row | the payload in the database becomes binary |
+| Check in CI only | nobody at run time | nothing is stopped at run time |
+
+The plan is the second option, with Avro, and first for one message type only: `StockReserved`. The outbox payload
+becomes bytes that Debezium passes through unchanged.
+
+**Several types on one topic.** `inventory` carries `StockReserved`, `StockRejected` and `StockReleased`. The default
+subject naming, `TopicNameStrategy`, allows one schema per topic. `RecordNameStrategy` gives each record type its own
+subject instead.
+
+**Compatibility.** The default level is `BACKWARD`: a consumer with the new schema must be able to read data written
+with the old one. Checked by hand on a probe subject, deleted afterwards:
+
+- Adding a field with a default: `is_compatible: true`.
+- Adding a field without a default: `is_compatible: false`, `READER_FIELD_MISSING_DEFAULT_VALUE`. Registering it
+  returned HTTP 409.
+
+So a breaking change is refused when it is registered, before any message is written with it.
+
