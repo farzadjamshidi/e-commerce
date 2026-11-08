@@ -2400,3 +2400,36 @@ commit, Debezium and Kafka. This is one order, and the gaps cannot be split furt
 the same tree. Before this step it would have been 7 traces. The timeout path is not covered: the scheduler has no
 order context, which is the next step.
 
+## Tracing 4: the timeout joins the order's trace
+
+`SagaTimeout` runs from a scheduler, so no request stands behind it. Its work used to land in the job's own trace, and
+the compensation of an order was invisible from that order's trace.
+
+The fix is the same idea as the outbox: the context is kept in the database, this time for later.
+
+- `order_sagas.traceparent` stores the context of the request that started the saga.
+- `TraceContext.current()` reads the context, and `OutboxWriter` uses it too.
+- `TraceContext.runIn()` restores a stored context: it extracts the parent, starts a span and makes it current.
+- `SagaTimeout` runs each stuck saga in a `saga timeout <state>` span. Everything written inside it, like `ReleaseStock`,
+  takes that span as its parent.
+
+Stored context needs the span to be started by hand, because no framework restores it. The parent span ended long ago.
+That is fine: a parent is only an id, and it does not need to be alive.
+
+**Observed**, with inventory stopped so that the saga could not move, and restarted after the timeout:
+
+```text
+http post /orders                      0 ms
+  inventory-commands process      50068 ms    ReserveStock, after the restart
+    inventory process             50734 ms    StockReserved, a late reply
+  saga timeout RESERVING_STOCK    33725 ms
+    inventory-commands process    50130 ms    ReleaseStock
+      inventory process           50772 ms    StockReleased
+```
+
+One trace shows the whole incident: the request, a 33 s wait, the timeout, and the late command with its compensation
+as two branches. The order ended `CANCELLED` and the reservation `RELEASED`.
+
+A saga with `traceparent` null, like one started before the migration, still worked. Its order ended `CANCELLED`, and
+its compensation stayed in the scheduler's trace, which is the old behavior.
+

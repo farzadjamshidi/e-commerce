@@ -11,8 +11,10 @@ import java.util.UUID;
 interface OrderSagaRepository extends Repository<OrderSaga, UUID> {
 
     @Modifying
-    @Query(value = "INSERT INTO order_sagas (order_id, state) VALUES (:orderId, :state)", nativeQuery = true)
-    void insert(UUID orderId, String state);
+    @Query(value = """
+            INSERT INTO order_sagas (order_id, state, traceparent)
+            VALUES (:orderId, :state, :traceparent)""", nativeQuery = true)
+    void insert(UUID orderId, String state, String traceparent);
 
     // The saga's state machine: a step is taken only from the state that expects it.
     // Returns 0 for a late or repeated reply, which then changes nothing.
@@ -23,7 +25,8 @@ interface OrderSagaRepository extends Repository<OrderSaga, UUID> {
     int transition(UUID orderId, String from, String to);
 
     @Query(value = """
-            SELECT order_id FROM order_sagas WHERE state = :state AND updated_at < :before
+            SELECT order_id AS "orderId", traceparent FROM order_sagas
+            WHERE state = :state AND updated_at < :before
             ORDER BY updated_at LIMIT :limit""", nativeQuery = true)
-    List<UUID> findStuck(String state, Instant before, int limit);
+    List<StuckSaga> findStuck(String state, Instant before, int limit);
 }

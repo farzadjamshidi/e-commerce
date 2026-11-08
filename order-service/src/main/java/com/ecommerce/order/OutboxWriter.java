@@ -1,13 +1,8 @@
 package com.ecommerce.order;
 
 import java.time.Instant;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.UUID;
 
-import io.micrometer.tracing.Span;
-import io.micrometer.tracing.Tracer;
-import io.micrometer.tracing.propagation.Propagator;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
@@ -21,19 +16,18 @@ class OutboxWriter {
 
     private final OutboxEventRepository outboxEventRepository;
     private final JsonMapper jsonMapper;
-    private final Tracer tracer;
-    private final Propagator propagator;
+    private final TraceContext traceContext;
     private final boolean relayEnabled;
 
-    OutboxWriter(OutboxEventRepository outboxEventRepository, JsonMapper jsonMapper, Tracer tracer,
-                 Propagator propagator, @Value("${outbox.relay.enabled:false}") boolean relayEnabled) {
+    OutboxWriter(OutboxEventRepository outboxEventRepository, JsonMapper jsonMapper, TraceContext traceContext,
+                 @Value("${outbox.relay.enabled:false}") boolean relayEnabled) {
         this.outboxEventRepository = outboxEventRepository;
         this.jsonMapper = jsonMapper;
-        this.tracer = tracer;
-        this.propagator = propagator;
+        this.traceContext = traceContext;
         this.relayEnabled = relayEnabled;
     }
 
+    // Debezium produces the Kafka record in another process, so the trace context travels in the row.
     // Must join the caller's transaction, or the message could be sent without the business change
     @Transactional(propagation = Propagation.MANDATORY)
     void write(UUID messageId, String destination, UUID orderId, String messageType, Object message,
@@ -42,23 +36,12 @@ class OutboxWriter {
         // With a plain save, delete() would see a "new" entity and silently do nothing.
         OutboxEvent outboxEvent = outboxEventRepository.saveAndFlush(OutboxEvent.create(messageId, destination,
                 AGGREGATE_TYPE, orderId.toString(), messageType, jsonMapper.writeValueAsString(message), createdAt,
-                traceparent()));
+                traceContext.current()));
 
         // Debezium reads the INSERT from the WAL, so the row itself is no longer needed.
         // The polling relay reads the table, so the row must stay while it is in use.
         if (!relayEnabled) {
             outboxEventRepository.delete(outboxEvent);
         }
-    }
-
-    // Debezium produces the Kafka record in another process, so the context has to travel in the row
-    private String traceparent() {
-        Span span = tracer.currentSpan();
-        if (span == null) {
-            return null;
-        }
-        Map<String, String> headers = new HashMap<>();
-        propagator.inject(span.context(), headers, Map::put);
-        return headers.get("traceparent");
     }
 }

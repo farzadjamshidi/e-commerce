@@ -20,14 +20,16 @@ class SagaTimeout {
 
     private final OrderSagaRepository orderSagaRepository;
     private final OrderSagaOrchestrator orderSagaOrchestrator;
+    private final TraceContext traceContext;
     private final Duration after;
     private final int batchSize;
 
     SagaTimeout(OrderSagaRepository orderSagaRepository, OrderSagaOrchestrator orderSagaOrchestrator,
-                @Value("${order.saga-timeout.after}") Duration after,
+                TraceContext traceContext, @Value("${order.saga-timeout.after}") Duration after,
                 @Value("${order.saga-timeout.batch-size}") int batchSize) {
         this.orderSagaRepository = orderSagaRepository;
         this.orderSagaOrchestrator = orderSagaOrchestrator;
+        this.traceContext = traceContext;
         this.after = after;
         this.batchSize = batchSize;
     }
@@ -43,8 +45,9 @@ class SagaTimeout {
 
     // One transaction per saga: a failure does not undo the others
     private void check(SagaState state, Instant before, Consumer<UUID> action) {
-        List<UUID> stuck = orderSagaRepository.findStuck(state.name(), before, batchSize);
-        stuck.forEach(action);
+        List<StuckSaga> stuck = orderSagaRepository.findStuck(state.name(), before, batchSize);
+        stuck.forEach(saga -> traceContext.runIn(saga.getTraceparent(), "saga timeout " + state,
+                () -> action.accept(saga.getOrderId())));
         if (!stuck.isEmpty()) {
             log.info("Timeout: {} sagas in {} longer than {}", stuck.size(), state, after);
         }

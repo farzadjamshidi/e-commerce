@@ -28,6 +28,8 @@ class OrderSaga {
     @Column(nullable = false, insertable = false, updatable = false)
     private Instant updatedAt;
 
+    private String traceparent;
+
     protected OrderSaga() {
     }
 }

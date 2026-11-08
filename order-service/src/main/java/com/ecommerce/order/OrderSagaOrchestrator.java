@@ -18,18 +18,20 @@ class OrderSagaOrchestrator {
     private final OrderSagaRepository orderSagaRepository;
     private final OrderRepository orderRepository;
     private final OutboxWriter outboxWriter;
+    private final TraceContext traceContext;
 
     OrderSagaOrchestrator(OrderSagaRepository orderSagaRepository, OrderRepository orderRepository,
-                          OutboxWriter outboxWriter) {
+                          OutboxWriter outboxWriter, TraceContext traceContext) {
         this.orderSagaRepository = orderSagaRepository;
         this.orderRepository = orderRepository;
         this.outboxWriter = outboxWriter;
+        this.traceContext = traceContext;
     }
 
     // Joins placeOrder's transaction: no order without a saga, no saga without its first command
     @Transactional(propagation = Propagation.MANDATORY)
     void start(Order order) {
-        orderSagaRepository.insert(order.getId(), SagaState.RESERVING_STOCK.name());
+        orderSagaRepository.insert(order.getId(), SagaState.RESERVING_STOCK.name(), traceContext.current());
         ReserveStockCommand command = ReserveStockCommand.from(order);
         outboxWriter.write(command.commandId(), INVENTORY_COMMANDS_TOPIC, order.getId(), command.commandType(),
                 command, command.issuedAt());
