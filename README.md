@@ -2464,3 +2464,27 @@ DLT. A test is only trusted after it has been seen failing.
 The listener metrics were tried first as the signal, but they stayed at 0 in the test context. The cause was not
 investigated. The test asks Kafka for the committed offsets instead, which needs no test configuration.
 
+## Testing 2: payment
+
+`PaymentCommandIntegrationTest` uses the same setup as inventory: real Postgres and Kafka, the `debezium` role, and the
+committed offsets plus an empty DLT as the sign that every command ended cleanly.
+
+| Test | Commands, same key | Expected |
+|---|---|---|
+| `chargeCompletesPayment` | `ChargePayment` | `COMPLETED` |
+| `refundAfterChargeRefundsPayment` | `ChargePayment`, `RefundPayment` | `REFUNDED` |
+| `refundWithoutChargeChangesNothing` | `RefundPayment` | no payment row, nothing on the DLT |
+
+The third case is real: after a timeout the saga sends a refund without knowing whether a charge happened.
+
+**Each test was seen failing.** With the refund turned into a no-op, the second test failed with `COMPLETED`. With a
+refund that throws when there is nothing to refund, the third test failed with one record on the DLT.
+
+**Found: a charge after its refund takes the money.** As an experiment, `RefundPayment` was sent before
+`ChargePayment` for the same order. The refund found nothing, and the charge then created a `COMPLETED` payment. That
+order is already cancelled, so nothing would ever refund it.
+
+In the normal flow this cannot happen. Both commands have the order id as key and go to one partition, and the saga
+sends the refund only after the charge. But it can happen when a `ChargePayment` is replayed by hand from
+`payment-commands-dlt` after the saga gave up. The experiment was not kept as a test, because it would assert the bug.
+
