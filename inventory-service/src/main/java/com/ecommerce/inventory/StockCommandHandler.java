@@ -13,20 +13,24 @@ class StockCommandHandler {
 
     private static final Logger log = LoggerFactory.getLogger(StockCommandHandler.class);
     private static final String AGGREGATE_TYPE = "Reservation";
+    // Debezium routes every reply of this service to this topic
+    private static final String REPLY_TOPIC = "inventory";
 
     private final ProcessedEventRepository processedEventRepository;
     private final StockRepository stockRepository;
     private final ReservationRepository reservationRepository;
     private final OutboxWriter outboxWriter;
+    private final AvroEncoder avroEncoder;
     private final JsonMapper jsonMapper;
 
     StockCommandHandler(ProcessedEventRepository processedEventRepository, StockRepository stockRepository,
                         ReservationRepository reservationRepository, OutboxWriter outboxWriter,
-                        JsonMapper jsonMapper) {
+                        AvroEncoder avroEncoder, JsonMapper jsonMapper) {
         this.processedEventRepository = processedEventRepository;
         this.stockRepository = stockRepository;
         this.reservationRepository = reservationRepository;
         this.outboxWriter = outboxWriter;
+        this.avroEncoder = avroEncoder;
         this.jsonMapper = jsonMapper;
     }
 
@@ -55,7 +59,9 @@ class StockCommandHandler {
         if (stockRepository.reserve(command.sku(), command.quantity()) == 1) {
             reservationRepository.insertReserved(command.orderId(), command.sku(), command.quantity());
             StockReservedEvent reserved = StockReservedEvent.from(command);
-            outboxWriter.write(reserved.eventId(), AGGREGATE_TYPE, orderId, reserved.eventType(), reserved);
+            // The first reply with a registered schema; the others are still JSON
+            outboxWriter.writeBytes(reserved.eventId(), AGGREGATE_TYPE, orderId, reserved.eventType(),
+                    avroEncoder.encode(REPLY_TOPIC, reserved));
             log.info("Reserved {} x {} for order {}", command.quantity(), command.sku(), orderId);
         } else {
             // A business outcome, not a failure: retrying will not create stock

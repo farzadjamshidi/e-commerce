@@ -32,8 +32,13 @@ class OutboxWriter {
     // Must join the caller's transaction, or the event could be sent without the business change
     @Transactional(propagation = Propagation.MANDATORY)
     void write(UUID eventId, String aggregateType, String aggregateId, String eventType, Object event) {
-        outboxEventRepository.insert(eventId, aggregateType, aggregateId, eventType, jsonMapper.writeValueAsString(event),
-                traceparent());
+        writeBytes(eventId, aggregateType, aggregateId, eventType, jsonMapper.writeValueAsBytes(event));
+    }
+
+    // For a payload already serialized, such as Avro
+    @Transactional(propagation = Propagation.MANDATORY)
+    void writeBytes(UUID eventId, String aggregateType, String aggregateId, String eventType, byte[] payload) {
+        outboxEventRepository.insert(eventId, aggregateType, aggregateId, eventType, payload, traceparent());
         outboxEventRepository.delete(eventId);
     }
 

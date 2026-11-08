@@ -22,13 +22,16 @@ class InventoryReplyListener {
         this.inventoryReplyHandler = inventoryReplyHandler;
     }
 
-    @KafkaListener(id = "inventory-replies", idIsGroup = false, topics = "inventory")
-    void onInventoryReply(ConsumerRecord<String, String> record, Acknowledgment ack) {
+    // Bytes, because StockReserved is Avro and the other replies are still JSON
+    @KafkaListener(id = "inventory-replies", idIsGroup = false, topics = "inventory",
+            properties = "value.deserializer=org.apache.kafka.common.serialization.ByteArrayDeserializer")
+    void onInventoryReply(ConsumerRecord<String, byte[]> record, Acknowledgment ack) {
         String eventId = header(record, "eventId");
         if (eventId == null) {
             log.warn("No eventId header <- partition {} offset {}, skipped", record.partition(), record.offset());
         } else {
-            inventoryReplyHandler.handle(UUID.fromString(eventId), header(record, "eventType"), record.value());
+            inventoryReplyHandler.handle(UUID.fromString(eventId), header(record, "eventType"), record.topic(),
+                    record.value());
         }
         // Acknowledged only after the database commit; the inbox absorbs redelivery
         ack.acknowledge();

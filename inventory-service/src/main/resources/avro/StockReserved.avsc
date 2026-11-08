@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "StockReserved",
+  "namespace": "com.ecommerce.inventory",
+  "doc": "Reply to ReserveStock: the stock for the order is held.",
+  "fields": [
+    {"name": "eventId", "type": {"type": "string", "logicalType": "uuid"}},
+    {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "orderId", "type": {"type": "string", "logicalType": "uuid"}}
+  ]
+}

@@ -28,7 +28,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 // Real Postgres and Kafka in containers. Debezium is not part of it, so replies are not checked here.
-@SpringBootTest(properties = "management.tracing.export.enabled=false")
+// mock:// is an in-memory Schema Registry from Confluent's serializer library
+@SpringBootTest(properties = {"management.tracing.export.enabled=false", "schema-registry.url=mock://inventory-test"})
 @Testcontainers
 class StockCommandIntegrationTest {
 

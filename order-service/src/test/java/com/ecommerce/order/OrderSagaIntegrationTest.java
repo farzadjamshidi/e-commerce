@@ -2,8 +2,19 @@ package com.ecommerce.order;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
+import io.confluent.kafka.serializers.subject.RecordNameStrategy;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.TopicPartition;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,7 +22,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaAdmin;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.kafka.KafkaContainer;
@@ -30,11 +40,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 // The replies of inventory and payment are sent by the test. Debezium is not part of it.
-@SpringBootTest(properties = "management.tracing.export.enabled=false")
+// mock:// is an in-memory Schema Registry, shared by every client in this JVM that uses the same name
+@SpringBootTest(properties = {"management.tracing.export.enabled=false", "schema-registry.url=mock://order-test"})
 @Testcontainers
 class OrderSagaIntegrationTest {
 
     private static final List<String> REPLY_TOPICS = List.of("inventory", "payments");
+    // A copy of inventory's schema, as inventory would write it
+    private static final Schema STOCK_RESERVED = new Schema.Parser().parse("""
+            {"type": "record", "name": "StockReserved", "namespace": "com.ecommerce.inventory", "fields": [
+              {"name": "eventId", "type": {"type": "string", "logicalType": "uuid"}},
+              {"name": "occurredAt", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+              {"name": "orderId", "type": {"type": "string", "logicalType": "uuid"}}]}""");
 
     @Container
     @ServiceConnection
@@ -48,8 +65,6 @@ class OrderSagaIntegrationTest {
     @Autowired
     OrderService orderService;
 
-    @Autowired
-    KafkaTemplate<String, String> kafkaTemplate;
 
     @Autowired
     JdbcTemplate jdbc;
@@ -58,6 +73,25 @@ class OrderSagaIntegrationTest {
     KafkaAdmin kafkaAdmin;
 
     // The outbox row is deleted in its own transaction, so a trigger keeps a copy of everything the service sends
+    KafkaProducer<String, byte[]> producer;
+    KafkaAvroSerializer avroSerializer;
+
+    // Bytes, like the real inventory topic: Avro for StockReserved, JSON for the rest
+    @BeforeEach
+    void createProducer() {
+        producer = new KafkaProducer<>(Map.of(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers()),
+                new StringSerializer(), new ByteArraySerializer());
+        avroSerializer = new KafkaAvroSerializer();
+        avroSerializer.configure(Map.of(
+                KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, "mock://order-test",
+                KafkaAvroSerializerConfig.VALUE_SUBJECT_NAME_STRATEGY, RecordNameStrategy.class.getName()), false);
+    }
+
+    @AfterEach
+    void closeProducer() {
+        producer.close();
+    }
+
     @BeforeEach
     void recordSentMessages() {
         jdbc.execute("""
@@ -114,12 +148,24 @@ class OrderSagaIntegrationTest {
         return orderService.placeOrder("test", "sku-1", 1, new BigDecimal("10.00"), "EUR").getId();
     }
 
-    private void reply(String topic, UUID orderId, String type, UUID eventId) {
-        ProducerRecord<String, String> record = new ProducerRecord<>(topic, orderId.toString(), """
-                {"orderId":"%s"}""".formatted(orderId));
+    private void reply(String topic, UUID orderId, String type, UUID eventId) throws Exception {
+        ProducerRecord<String, byte[]> record = new ProducerRecord<>(topic, orderId.toString(),
+                payload(topic, orderId, type, eventId));
         record.headers().add("eventId", eventId.toString().getBytes(StandardCharsets.UTF_8));
         record.headers().add("eventType", type.getBytes(StandardCharsets.UTF_8));
-        kafkaTemplate.send(record).join();
+        producer.send(record).get();
+    }
+
+    private byte[] payload(String topic, UUID orderId, String type, UUID eventId) {
+        if (StockReply.RESERVED.equals(type)) {
+            GenericRecord record = new GenericData.Record(STOCK_RESERVED);
+            record.put("eventId", eventId.toString());
+            record.put("occurredAt", System.currentTimeMillis());
+            record.put("orderId", orderId.toString());
+            return avroSerializer.serialize(topic, record);
+        }
+        return """
+                {"orderId":"%s"}""".formatted(orderId).getBytes(StandardCharsets.UTF_8);
     }
 
     // Commands only: the orders topic also gets OrderCreated

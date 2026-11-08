@@ -2569,3 +2569,42 @@ with the old one. Checked by hand on a probe subject, deleted afterwards:
 
 So a breaking change is refused when it is registered, before any message is written with it.
 
+## Schemas 2: StockReserved in Avro
+
+The first message with a registered schema. Written and read in one step, because a written-only change would leave
+order-service unable to read `StockReserved` and stop every saga.
+
+**Inventory writes it.**
+
+- `avro/StockReserved.avsc` is the contract: `eventId`, `occurredAt`, `orderId`.
+- `AvroEncoder` builds a record and runs `KafkaAvroSerializer`. The result is the standard wire format: byte `0`, a
+  4-byte schema id, then the Avro data. The serializer registers the schema on first use, with
+  `RecordNameStrategy`, so the subject is `com.ecommerce.inventory.StockReserved`.
+- Migration `V6` turns `outbox_events.payload` into `BYTEA`. JSON replies keep their text as UTF-8 bytes, so their
+  consumers see the same bytes as before.
+
+**Debezium passes the bytes through.** The inventory connector uses `ByteArrayConverter`, so the payload reaches Kafka
+unchanged. That converter accepts only bytes, and the heartbeat records are structs, so a `Filter` drops every record
+that is not from the outbox table. The slot still advances: its `confirmed_flush_lsn` moved while the service was idle.
+The heartbeat topics of inventory are no longer written.
+
+**Order-service reads it.** The inventory listener now takes bytes. For `StockReserved` it uses `AvroDecoder`, which
+reads with the writer's schema from the registry, found by the id in the message. Order-service keeps no copy of the
+schema and reads `orderId` by name, so a field added later does not break it. The other replies are still read as
+JSON.
+
+**A registry call inside a database transaction.** The first `StockReserved` needs the registry, to
+register the schema and get its id. After that the id is cached. If the registry is down at the first use, the
+transaction should fail and the command be retried, then go to the DLT. This was not tested. In production `auto.register.schemas` is usually off, and the schema is
+registered by the build, so a service cannot publish a schema nobody reviewed.
+
+**Tests.** `mock://` is an in-memory registry from Confluent's library, so the tests need no registry container. The
+order-service test now sends `StockReserved` in Avro. All 8 tests pass.
+
+**Observed:**
+
+- Success, payment failure and no stock: `CONFIRMED`, `CANCELLED`, `CANCELLED`, with nothing new on any DLT.
+- One subject, `com.ecommerce.inventory.StockReserved`, version 1.
+- A `StockReserved` record on the topic started with byte `0` and schema id `2`. The `StockReleased` records next to it
+  were still plain JSON.
+
