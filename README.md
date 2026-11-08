@@ -2433,3 +2433,34 @@ as two branches. The order ended `CANCELLED` and the reservation `RELEASED`.
 A saga with `traceparent` null, like one started before the migration, still worked. Its order ended `CANCELLED`, and
 its compensation stayed in the scheduler's trace, which is the old behavior.
 
+## Testing 1: inventory against real Postgres and Kafka
+
+Testcontainers starts Docker containers from inside a test and removes them afterwards. The tests so far were shell
+scripts against Docker Compose. This is the first automated one: `StockCommandIntegrationTest` in inventory-service.
+
+- `postgres:18.1` and `apache/kafka:4.1.0`, the same images as Docker Compose, so behavior like `ON CONFLICT` and
+  partition order is the real one.
+- `@ServiceConnection` points the datasource and Kafka properties at the containers. No URL is written by hand.
+- `create-debezium-role.sql` creates the `debezium` role, because a migration grants it access to the outbox. In
+  Compose that role comes from `infra/postgres/init.sql`.
+- Each test inserts its own SKU, so the tests do not depend on each other or on the demo stock.
+- Debezium is not in the test, so the reply messages are not checked. The outbox row is deleted in the same
+  transaction, so the test can only see the stock, the reservation and the Kafka offsets.
+
+`mvn test` needs Docker running. Startup is about 4 s for the containers, and the whole class takes about 11 s.
+
+**Tests:**
+
+- `reserveStockCommandReservesStock`: one `ReserveStock`, then the reservation is `RESERVED` and stock is `3/2`.
+- `sameCommandTwiceReservesOnce`: the same command id twice. The group commits both records, the DLT stays empty, and
+  stock is `3/2`.
+
+**The first duplicate test proved nothing.** It only checked the stock. With the inbox check removed from the code, it
+still passed: the second insert hit the primary key of `reservations` and rolled back, so the stock stayed right. The
+difference is in how the copy ends. With the inbox it is skipped. Without it, it fails, is retried for about 7 s and
+lands on the DLT. The test now checks that, and with the inbox removed it fails with `expected: 0L but was: 1L` on the
+DLT. A test is only trusted after it has been seen failing.
+
+The listener metrics were tried first as the signal, but they stayed at 0 in the test context. The cause was not
+investigated. The test asks Kafka for the committed offsets instead, which needs no test configuration.
+
