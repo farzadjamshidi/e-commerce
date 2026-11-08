@@ -1,0 +1,171 @@
+package com.ecommerce.order;
+
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.KafkaAdmin;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.kafka.KafkaContainer;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+
+// The replies of inventory and payment are sent by the test. Debezium is not part of it.
+@SpringBootTest(properties = "management.tracing.export.enabled=false")
+@Testcontainers
+class OrderSagaIntegrationTest {
+
+    private static final List<String> REPLY_TOPICS = List.of("inventory", "payments");
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:18.1")
+            .withInitScript("create-debezium-role.sql");
+
+    @Container
+    @ServiceConnection
+    static KafkaContainer kafka = new KafkaContainer("apache/kafka:4.1.0");
+
+    @Autowired
+    OrderService orderService;
+
+    @Autowired
+    KafkaTemplate<String, String> kafkaTemplate;
+
+    @Autowired
+    JdbcTemplate jdbc;
+
+    @Autowired
+    KafkaAdmin kafkaAdmin;
+
+    // The outbox row is deleted in its own transaction, so a trigger keeps a copy of everything the service sends
+    @BeforeEach
+    void recordSentMessages() {
+        jdbc.execute("""
+                CREATE TABLE IF NOT EXISTS sent_messages (aggregate_id TEXT, destination TEXT, event_type TEXT);
+                CREATE OR REPLACE FUNCTION copy_outbox() RETURNS trigger AS $$
+                BEGIN
+                    INSERT INTO sent_messages VALUES (NEW.aggregate_id, NEW.destination, NEW.event_type);
+                    RETURN NEW;
+                END $$ LANGUAGE plpgsql;
+                CREATE OR REPLACE TRIGGER copy_outbox AFTER INSERT ON outbox_events
+                    FOR EACH ROW EXECUTE FUNCTION copy_outbox();
+                """);
+    }
+
+    @Test
+    void sagaCompletesWhenStockAndPaymentSucceed() throws Exception {
+        UUID orderId = placeOrder();
+        assertThat(sentCommands(orderId)).containsExactly("ReserveStock");
+
+        reply("inventory", orderId, StockReply.RESERVED, UUID.randomUUID());
+        awaitAllHandled();
+        assertThat(sagaState(orderId)).isEqualTo("CHARGING_PAYMENT");
+        assertThat(sentCommands(orderId)).containsExactly("ReserveStock", "ChargePayment");
+
+        reply("payments", orderId, PaymentReply.COMPLETED, UUID.randomUUID());
+        awaitAllHandled();
+        assertThat(sagaState(orderId)).isEqualTo("COMPLETED");
+        assertThat(orderStatus(orderId)).isEqualTo("CONFIRMED");
+    }
+
+    @Test
+    void repeatedAndLateRepliesChangeNothing() throws Exception {
+        UUID orderId = placeOrder();
+        UUID reservedId = UUID.randomUUID();
+
+        // The same reply delivered twice, then a copy with a new id, as a resent compensation would have
+        reply("inventory", orderId, StockReply.RESERVED, reservedId);
+        reply("inventory", orderId, StockReply.RESERVED, reservedId);
+        reply("inventory", orderId, StockReply.RESERVED, UUID.randomUUID());
+        awaitAllHandled();
+        assertThat(sentCommands(orderId)).containsExactly("ReserveStock", "ChargePayment");
+
+        reply("payments", orderId, PaymentReply.COMPLETED, UUID.randomUUID());
+        // A reply that is no longer expected: the saga has finished
+        reply("inventory", orderId, StockReply.REJECTED, UUID.randomUUID());
+        awaitAllHandled();
+
+        assertThat(sagaState(orderId)).isEqualTo("COMPLETED");
+        assertThat(orderStatus(orderId)).isEqualTo("CONFIRMED");
+        assertThat(sentCommands(orderId)).containsExactly("ReserveStock", "ChargePayment");
+    }
+
+    private UUID placeOrder() {
+        return orderService.placeOrder("test", "sku-1", 1, new BigDecimal("10.00"), "EUR").getId();
+    }
+
+    private void reply(String topic, UUID orderId, String type, UUID eventId) {
+        ProducerRecord<String, String> record = new ProducerRecord<>(topic, orderId.toString(), """
+                {"orderId":"%s"}""".formatted(orderId));
+        record.headers().add("eventId", eventId.toString().getBytes(StandardCharsets.UTF_8));
+        record.headers().add("eventType", type.getBytes(StandardCharsets.UTF_8));
+        kafkaTemplate.send(record).join();
+    }
+
+    // Commands only: the orders topic also gets OrderCreated
+    private List<String> sentCommands(UUID orderId) {
+        return jdbc.queryForList("""
+                SELECT event_type FROM sent_messages WHERE aggregate_id = ? AND destination LIKE '%-commands'""",
+                String.class, orderId.toString());
+    }
+
+    private String sagaState(UUID orderId) {
+        return jdbc.queryForObject("SELECT state FROM order_sagas WHERE order_id = ?", String.class, orderId);
+    }
+
+    private String orderStatus(UUID orderId) {
+        return jdbc.queryForObject("SELECT status FROM orders WHERE id = ?", String.class, orderId);
+    }
+
+    // Every reply committed and none on a DLT: each one ended cleanly, not through the error handler
+    private void awaitAllHandled() throws Exception {
+        for (String topic : REPLY_TOPICS) {
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                    assertThat(committed(topic)).isEqualTo(endOffset(topic)));
+            assertThat(endOffset(topic + "-dlt")).isZero();
+        }
+    }
+
+    // Records written to a topic, over all partitions; 0 if the topic was never created
+    private long endOffset(String topic) throws ExecutionException, InterruptedException {
+        try (Admin admin = Admin.create(kafkaAdmin.getConfigurationProperties())) {
+            if (!admin.listTopics().names().get().contains(topic)) {
+                return 0;
+            }
+            Map<TopicPartition, OffsetSpec> request = admin.describeTopics(List.of(topic)).allTopicNames().get()
+                    .get(topic).partitions().stream()
+                    .collect(Collectors.toMap(p -> new TopicPartition(topic, p.partition()), p -> OffsetSpec.latest()));
+            return admin.listOffsets(request).all().get().values().stream().mapToLong(o -> o.offset()).sum();
+        }
+    }
+
+    // Offsets this service has committed on a topic, over all partitions
+    private long committed(String topic) throws ExecutionException, InterruptedException {
+        try (Admin admin = Admin.create(kafkaAdmin.getConfigurationProperties())) {
+            return admin.listConsumerGroupOffsets("order-service").partitionsToOffsetAndMetadata().get()
+                    .entrySet().stream()
+                    .filter(e -> e.getKey().topic().equals(topic) && e.getValue() != null)
+                    .mapToLong(e -> e.getValue().offset()).sum();
+        }
+    }
+}

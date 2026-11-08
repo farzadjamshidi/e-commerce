@@ -2506,3 +2506,36 @@ also be harmless, since the state machine ignores a reply it does not expect.
 **Why the check cannot race.** Check and insert are two statements. They are safe only because both commands of an
 order have the same key and are handled one after the other in one partition. The comment in the code says so.
 
+## Testing 3: order-service and the saga's two guards
+
+`OrderSagaIntegrationTest` places an order through `OrderService`, then plays inventory and payment by sending their
+replies to `inventory` and `payments`. Postgres and Kafka are real, Debezium is not.
+
+**Seeing what the service sends.** The outbox row is deleted in the transaction that writes it, so the test cannot read
+it. The test adds a trigger that copies every outbox insert into a `sent_messages` table. The trigger exists only in the
+test database.
+
+| Test | Replies | Expected |
+|---|---|---|
+| `sagaCompletesWhenStockAndPaymentSucceed` | `StockReserved`, `PaymentCompleted` | `ReserveStock`, `ChargePayment`; saga `COMPLETED`, order `CONFIRMED` |
+| `repeatedAndLateRepliesChangeNothing` | `StockReserved` twice with one id, once with a new id; `PaymentCompleted`; a late `StockRejected` | still one `ChargePayment`; saga `COMPLETED`, order `CONFIRMED`; no DLT record |
+
+**Each guard removed in turn:**
+
+| Code change | Result |
+|---|---|
+| none | pass |
+| inbox check removed | pass |
+| `AND state = :from` removed from `transition` | fail: `ReserveStock, ChargePayment, ChargePayment` |
+| both removed | fail |
+
+In the orchestrator the state machine is the guard that matters. It catches a repeat whatever its id, and the inbox
+only catches a repeat with the same id. The inbox still saves work: a repeat stops before the payload is read and before
+any saga query. Without the state guard, the copy with a new id sent a second `ChargePayment`. Payment's
+`insertIfAbsent` would then refuse the second charge, a third guard in another service, but the saga should not rely on
+it.
+
+Replies with a new id for the same step are real. A timeout resends `ReleaseStock` or `RefundPayment` with a new command
+id, and each one gets its own `StockReleased` or `PaymentRefunded`. The test uses `StockReserved` because it is the
+shortest path to show the guard.
+
