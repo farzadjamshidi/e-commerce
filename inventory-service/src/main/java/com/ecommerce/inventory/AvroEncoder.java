@@ -4,8 +4,8 @@ import io.confluent.kafka.serializers.KafkaAvroSerializer;
 import io.confluent.kafka.serializers.KafkaAvroSerializerConfig;
 import io.confluent.kafka.serializers.subject.RecordNameStrategy;
 import org.apache.avro.Schema;
-import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.generic.GenericRecordBuilder;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -31,10 +31,12 @@ class AvroEncoder {
     }
 
     byte[] encode(String topic, StockReservedEvent event) {
-        GenericRecord record = new GenericData.Record(stockReserved);
-        record.put("eventId", event.eventId().toString());
-        record.put("occurredAt", event.occurredAt().toEpochMilli());
-        record.put("orderId", event.orderId().toString());
+        // The builder fills every field not set here with its default from the schema
+        GenericRecord record = new GenericRecordBuilder(stockReserved)
+                .set("eventId", event.eventId().toString())
+                .set("occurredAt", event.occurredAt().toEpochMilli())
+                .set("orderId", event.orderId().toString())
+                .build();
         return serializer.serialize(topic, record);
     }
 

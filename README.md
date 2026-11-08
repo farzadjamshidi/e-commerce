@@ -2608,3 +2608,45 @@ order-service test now sends `StockReserved` in Avro. All 8 tests pass.
 - A `StockReserved` record on the topic started with byte `0` and schema id `2`. The `StockReleased` records next to it
   were still plain JSON.
 
+## Schemas 3: evolving StockReserved, and a bug from Schemas 2
+
+Each change below was made in inventory only. Order-service was not rebuilt or restarted between them.
+
+| Change | Compatibility | Registered | Order |
+|---|---|---|---|
+| none | `BACKWARD` (default) | version 1 | `CONFIRMED` |
+| add `warehouse` with default `"main"` | `BACKWARD` | version 2 | `CONFIRMED` |
+| remove `orderId` | `BACKWARD` | version 3, accepted | stuck, then `CANCELLED` by the timeout |
+| remove `orderId` | `FULL_TRANSITIVE` | refused | `CANCELLED` by the timeout |
+
+**`BACKWARD` protects the wrong side here.** It asks: can a reader with the new schema read old data? A removed field
+passes that test. But the reader that matters is order-service, which still expects `orderId`. It got
+`AvroRuntimeException` and the reply went to the DLT. For events read by other services, which upgrade on their own
+schedule, the question is also the reverse: can an old reader read new data? That is `FORWARD`. `FULL` is both, and
+`_TRANSITIVE` checks against every earlier version, not only the last one.
+
+The registry is now started with `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: full_transitive`. With it, the same
+removal failed in inventory with `Error registering Avro schema`, the command went to `inventory-commands-dlt`, and no
+message with the bad schema was written.
+
+**Version 3 had to be deleted first.** The registry answers a schema it already has with its existing id, without a
+compatibility check. Versions 2 and 3 were test changes and are not in the code: the schema file is back to the
+original, and version 3 was deleted from the registry.
+
+`AvroEncoder` now uses `GenericRecordBuilder`, which fills every field not set with its default from the schema. With
+`GenericData.Record`, a new field with a default would still have been null and failed to serialize.
+
+**Bug found: order-service could not write dead letters.** Since Schemas 2 the inventory listener reads `byte[]`, but
+the dead letter publisher used the string template. Publishing failed with `Can't convert value of class [B`, the
+record was never recovered, and it was retried again and again. Its partition was blocked, so the timeout's
+`StockReleased` waited behind it too.
+
+- Fix: `DeadLetterPublishingRecoverer` now gets one template per value type, `byte[]` and everything else.
+- `AvroRuntimeException` is not retried. A record that does not match the reader stays that way.
+- New test `unreadableAvroReplyGoesToTheDlt`. With the old configuration it failed, and the other two tests failed too,
+  because the blocked partition held their replies.
+- The DLT checks in the order-service test now compare with the count before each test, so a test may write to a DLT
+  on purpose.
+
+**Lesson:** changing a listener's value type also changes what its error handler has to write back.
+

@@ -113,6 +113,9 @@ services:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
+      # Events are read by other services that upgrade on their own schedule, so a new schema must be readable
+      # by old readers and read old data, against every earlier version, not only the last one
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: full_transitive
     depends_on:
       - kafka-1
       - kafka-2

@@ -30,6 +30,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -74,6 +75,8 @@ class OrderSagaIntegrationTest {
 
     // The outbox row is deleted in its own transaction, so a trigger keeps a copy of everything the service sends
     KafkaProducer<String, byte[]> producer;
+    // DLT records written by earlier tests, so each test checks only its own
+    Map<String, Long> dltBefore = new HashMap<>();
     KafkaAvroSerializer avroSerializer;
 
     // Bytes, like the real inventory topic: Avro for StockReserved, JSON for the rest
@@ -85,6 +88,13 @@ class OrderSagaIntegrationTest {
         avroSerializer.configure(Map.of(
                 KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, "mock://order-test",
                 KafkaAvroSerializerConfig.VALUE_SUBJECT_NAME_STRATEGY, RecordNameStrategy.class.getName()), false);
+    }
+
+    @BeforeEach
+    void countDeadLetters() throws Exception {
+        for (String topic : REPLY_TOPICS) {
+            dltBefore.put(topic, endOffset(topic + "-dlt"));
+        }
     }
 
     @AfterEach
@@ -144,6 +154,23 @@ class OrderSagaIntegrationTest {
         assertThat(sentCommands(orderId)).containsExactly("ReserveStock", "ChargePayment");
     }
 
+    // The inventory listener reads bytes, so its dead letters need a bytes serializer. With the default string
+    // template the publish failed and the record was retried forever, blocking its partition.
+    @Test
+    void unreadableAvroReplyGoesToTheDlt() throws Exception {
+        UUID orderId = placeOrder();
+
+        ProducerRecord<String, byte[]> record = new ProducerRecord<>("inventory", orderId.toString(),
+                "not-avro".getBytes(StandardCharsets.UTF_8));
+        record.headers().add("eventId", UUID.randomUUID().toString().getBytes(StandardCharsets.UTF_8));
+        record.headers().add("eventType", StockReply.RESERVED.getBytes(StandardCharsets.UTF_8));
+        producer.send(record).get();
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(endOffset("inventory-dlt")).isEqualTo(dltBefore.get("inventory") + 1));
+        assertThat(sagaState(orderId)).isEqualTo("RESERVING_STOCK");
+    }
+
     private UUID placeOrder() {
         return orderService.placeOrder("test", "sku-1", 1, new BigDecimal("10.00"), "EUR").getId();
     }
@@ -188,7 +215,7 @@ class OrderSagaIntegrationTest {
         for (String topic : REPLY_TOPICS) {
             await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                     assertThat(committed(topic)).isEqualTo(endOffset(topic)));
-            assertThat(endOffset(topic + "-dlt")).isZero();
+            assertThat(endOffset(topic + "-dlt")).isEqualTo(dltBefore.get(topic));
         }
     }
 
