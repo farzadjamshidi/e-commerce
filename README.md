@@ -2650,3 +2650,32 @@ record was never recovered, and it was retried again and again. Its partition wa
 
 **Lesson:** changing a listener's value type also changes what its error handler has to write back.
 
+## Schemas 4: the build registers schemas, the service only looks them up
+
+Until now inventory registered `StockReserved` itself, at the first message. A breaking change was found only at run
+time, inside a database transaction. Now:
+
+- `auto.register.schemas` is off in inventory (`schema-registry.auto-register: false`). The serializer only asks the
+  registry for the id of the exact schema it has. An unknown schema fails with `Schema not found`.
+- `kafka-schema-registry-maven-plugin` in inventory's `pom.xml` maps the subject to `avro/StockReserved.avsc`.
+  `mvn schema-registry:test-compatibility` checks the file against the registry, and `mvn schema-registry:register`
+  registers it. In a pipeline the first runs on every change and the second before the deploy.
+- `infra/setup.sh schemas` runs the register goal, because a fresh environment has an empty registry. The reset is now:
+  `topics`, start the services once, `connectors`, `schemas`.
+- Tests keep auto-register on, against `mock://`.
+
+**Observed:**
+
+| Case | Result |
+|---|---|
+| `orderId` removed, `test-compatibility` | `BUILD FAILURE`, not compatible |
+| `warehouse` added with a default, `test-compatibility` | `BUILD SUCCESS` |
+| the same change deployed without `register` | `Error retrieving Avro schema ... Schema not found`, command on `inventory-commands-dlt`, order `CANCELLED` by the timeout |
+| `register`, then a new order, no restart | registered as version 2, order `CONFIRMED` |
+
+The last row shows that a failed lookup is not cached: the running service found the schema as soon as it existed.
+Version 2 was a test change. The file is back to the original and version 2 was deleted from the registry.
+
+**Why this order matters.** A schema now reaches the registry only after a compatibility check, and a service cannot
+write a message with a schema that is not there. The check happens at build time, before any message exists.
+

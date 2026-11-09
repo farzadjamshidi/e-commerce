@@ -41,3 +41,4 @@ management:
 
 schema-registry:
   url: http://localhost:8085
+  auto-register: false

@@ -3,6 +3,7 @@
 #
 #   infra/setup.sh topics       after `docker compose up -d`
 #   infra/setup.sh connectors   after each service has started once (Flyway creates the publications)
+#   infra/setup.sh schemas      before inventory sends its first StockReserved; services do not register schemas
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -52,8 +53,20 @@ connectors() {
   done
 }
 
+schemas() {
+  until curl -sf localhost:8085/subjects >/dev/null; do
+    echo "waiting for schema registry..."
+    sleep 2
+  done
+
+  # The same goal a build pipeline runs, after schema-registry:test-compatibility
+  (cd inventory-service && ./mvnw -q -B schema-registry:register)
+  echo "registered schemas: $(curl -s localhost:8085/subjects)"
+}
+
 case "${1:-}" in
   topics) topics ;;
   connectors) connectors ;;
-  *) echo "usage: $0 topics|connectors" >&2; exit 1 ;;
+  schemas) schemas ;;
+  *) echo "usage: $0 topics|connectors|schemas" >&2; exit 1 ;;
 esac

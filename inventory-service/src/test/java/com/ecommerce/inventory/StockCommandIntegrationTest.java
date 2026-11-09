@@ -29,7 +29,8 @@ import static org.awaitility.Awaitility.await;
 
 // Real Postgres and Kafka in containers. Debezium is not part of it, so replies are not checked here.
 // mock:// is an in-memory Schema Registry from Confluent's serializer library
-@SpringBootTest(properties = {"management.tracing.export.enabled=false", "schema-registry.url=mock://inventory-test"})
+@SpringBootTest(properties = {"management.tracing.export.enabled=false", "schema-registry.url=mock://inventory-test",
+        "schema-registry.auto-register=true"})
 @Testcontainers
 class StockCommandIntegrationTest {
 

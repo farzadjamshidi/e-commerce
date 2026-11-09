@@ -28,6 +28,7 @@
 	</scm>
 	<properties>
 		<java.version>25</java.version>
+		<schema-registry.url>http://localhost:8085</schema-registry.url>
 	</properties>
 	<repositories>
 		<!-- Confluent's serializers are not on Maven Central -->
@@ -36,6 +37,12 @@
 			<url>https://packages.confluent.io/maven/</url>
 		</repository>
 	</repositories>
+	<pluginRepositories>
+		<pluginRepository>
+			<id>confluent</id>
+			<url>https://packages.confluent.io/maven/</url>
+		</pluginRepository>
+	</pluginRepositories>
 	<dependencies>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
@@ -116,6 +123,21 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+			</plugin>
+			<!-- Schemas are checked and registered here, by the build, and not by the service at run time:
+			     mvn schema-registry:test-compatibility, then mvn schema-registry:register -->
+			<plugin>
+				<groupId>io.confluent</groupId>
+				<artifactId>kafka-schema-registry-maven-plugin</artifactId>
+				<version>8.0.0</version>
+				<configuration>
+					<schemaRegistryUrls>
+						<param>${schema-registry.url}</param>
+					</schemaRegistryUrls>
+					<subjects>
+						<com.ecommerce.inventory.StockReserved>src/main/resources/avro/StockReserved.avsc</com.ecommerce.inventory.StockReserved>
+					</subjects>
+				</configuration>
 			</plugin>
 		</plugins>
 	</build>

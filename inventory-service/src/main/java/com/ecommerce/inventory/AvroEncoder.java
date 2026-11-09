@@ -22,9 +22,13 @@ class AvroEncoder {
     private final KafkaAvroSerializer serializer = new KafkaAvroSerializer();
     private final Schema stockReserved = load("avro/StockReserved.avsc");
 
-    AvroEncoder(@Value("${schema-registry.url}") String schemaRegistryUrl) {
+    AvroEncoder(@Value("${schema-registry.url}") String schemaRegistryUrl,
+                @Value("${schema-registry.auto-register}") boolean autoRegister) {
         serializer.configure(Map.of(
                 KafkaAvroSerializerConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryUrl,
+                // Off: the build registers the schema after checking it. The service only looks up its id,
+                // so a schema nobody checked fails here instead of reaching the topic.
+                KafkaAvroSerializerConfig.AUTO_REGISTER_SCHEMAS, autoRegister,
                 // inventory carries several record types, and the default allows one schema per topic
                 KafkaAvroSerializerConfig.VALUE_SUBJECT_NAME_STRATEGY, RecordNameStrategy.class.getName()),
                 false);
