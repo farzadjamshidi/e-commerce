@@ -3135,3 +3135,31 @@ would be needed again a moment later.
 Afterwards the delay was removed, order-service and payment-service scaled back to 1, and an order ended
 `CONFIRMED`.
 
+## Kubernetes 14: small batches let new consumers take part
+
+The guess from Kubernetes 13 was tested: inventory's Deployment now sets `SPRING_KAFKA_CONSUMER_MAX_POLL_RECORDS=20`.
+Same test as before: order and payment scaled to 0, 200 ms per record, 3000 records. The scaled object now allows 3
+replicas at most.
+
+| | `max.poll.records` 500 | `max.poll.records` 20 |
+|---|---|---|
+| 3 pods ready | +37 s | +37 s |
+| all 3 have partitions | +231 s | +37 s |
+| lag at 0 | +474 s | +298 s |
+| most replicas | 4, one idle | 3 |
+
+With 20 records per poll, a batch takes at most 4 s at 200 ms per record, so the old consumer gave up two partitions
+as soon as the new pods joined. The three pods drained the lag at about 15 records per second, three times the rate of
+one. The guess is confirmed.
+
+**The trade-off.** A small batch means more polls and more offset commits for the same work, which costs throughput
+when records are fast to handle. It pays off when each record is slow, as here, where every record is a database
+transaction. The setting is in the Kubernetes Deployment, where KEDA adds consumers, and not in `application.yml`, so
+Compose keeps the default.
+
+The rule behind it: the time to handle one batch, `max.poll.records` times the time per record, must stay well below
+`max.poll.interval.ms` (5 minutes by default), or the consumer is removed from the group. It is also how long a
+rebalance can wait for that consumer.
+
+Afterwards the delay was removed, order and payment were scaled back to 1, and an order ended `CONFIRMED`.
+

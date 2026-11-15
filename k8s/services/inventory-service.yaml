@@ -23,6 +23,10 @@ spec:
               value: jdbc:postgresql://postgres.ecommerce.svc:5432/inventory_db
             - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
               value: ecommerce-kafka-bootstrap.kafka.svc:9092
+            # A consumer gives up a partition only between polls. Small batches let a pod added by KEDA get partitions
+            # within seconds; with the default 500 it took over three minutes at 200 ms per record.
+            - name: SPRING_KAFKA_CONSUMER_MAX_POLL_RECORDS
+              value: "20"
             - name: SCHEMAREGISTRY_URL
               value: http://schema-registry.kafka.svc:8081
             # No Jaeger in the cluster: no spans and no OTLP metrics are sent
