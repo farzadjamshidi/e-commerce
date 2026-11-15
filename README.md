@@ -2715,3 +2715,37 @@ after start. The Compose stack had used about 3.5 GiB, out of 7.7 GiB given to D
 lack of memory: `idle mode activated ... dockerd has exited successfully ... idle: shutdown`. The settings have
 `UseResourceSaver: true`. Turning Resource Saver off in Docker Desktop avoids it.
 
+## Kubernetes 2: the Strimzi operator
+
+`k8s/setup.sh` builds the environment step by step, like `infra/setup.sh` does for Compose:
+
+```bash
+k8s/setup.sh cluster    # kind cluster
+k8s/setup.sh strimzi    # Strimzi operator, version 1.3.1, in namespace kafka
+```
+
+**Namespaces:** `kafka` holds the platform: the operator, Kafka, Connect and the schema registry. `ecommerce` will hold
+the application: Postgres and the three services. They reach Kafka across namespaces by its DNS name.
+
+**What an operator is.** Kubernetes knows Pods and Deployments, not Kafka. Strimzi adds new resource types (CRDs) and a
+controller that watches them. A `Kafka` resource says what is wanted; the operator compares it with what runs and fixes
+the difference, again and again. A broker that dies is recreated, a version change becomes a rolling restart, broker by
+broker.
+
+The install added ten CRDs, among them:
+
+| CRD | Replaces in this project |
+|---|---|
+| `Kafka`, `KafkaNodePool` | the three `kafka-*` services in `docker-compose.yml` |
+| `KafkaTopic` | `infra/setup.sh topics` |
+| `KafkaConnect`, `KafkaConnector` | the `connect` container and `infra/setup.sh connectors` |
+| `StrimziPodSet` | Strimzi's own replacement for a StatefulSet, so it can restart one broker of its choice |
+
+The install file is the release asset, pinned to 1.3.1. It binds its roles to the namespace `myproject`, so the script
+rewrites that to `kafka`. The operator watches only its own namespace.
+
+Strimzi 1.3.1 supports Kafka 4.2.x and 4.3.x, not the 4.1.0 used in Compose. The services' Kafka clients are 4.2.2.
+
+**Observed:** the operator pod `Running` on `ecommerce-worker2`, image `quay.io/strimzi/operator:1.3.1`, with the log
+line `Cluster Operator verticle started in namespace kafka`.
+
