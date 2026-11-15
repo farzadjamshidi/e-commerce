@@ -4,6 +4,7 @@
 #   k8s/setup.sh cluster    kind cluster with one control plane and two workers
 #   k8s/setup.sh strimzi    the Strimzi operator, in the kafka namespace
 #   k8s/setup.sh kafka      the Kafka cluster, three nodes in KRaft mode, and its topics
+#   k8s/setup.sh postgres   Postgres with the three service databases, in the ecommerce namespace
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -35,9 +36,22 @@ kafka() {
   kubectl -n kafka wait kafkatopic --all --for=condition=Ready --timeout=120s
 }
 
+postgres() {
+  kubectl create namespace ecommerce --dry-run=client -o yaml | kubectl apply -f -
+  # Practice credentials, created here so no secret is written in a file
+  kubectl -n ecommerce create secret generic postgres --from-literal=password=postgres \
+    --dry-run=client -o yaml | kubectl apply -f -
+  # The same script Compose runs, so users and databases are defined once
+  kubectl -n ecommerce create configmap postgres-init --from-file=infra/postgres/init.sql \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl apply -f k8s/postgres/postgres.yaml
+  kubectl -n ecommerce rollout status statefulset/postgres --timeout=300s
+}
+
 case "${1:-}" in
   cluster) cluster ;;
   strimzi) strimzi ;;
   kafka) kafka ;;
-  *) echo "usage: $0 cluster|strimzi|kafka" >&2; exit 1 ;;
+  postgres) postgres ;;
+  *) echo "usage: $0 cluster|strimzi|kafka|postgres" >&2; exit 1 ;;
 esac

@@ -2813,3 +2813,29 @@ add partitions but never remove them.
 **Observed:** all 15 `KafkaTopic` resources `Ready`, all 15 topics listed by `kafka-topics.sh`. `payments` has 3
 partitions with leaders 0, 1 and 2, each replicated to all three brokers, and `min.insync.replicas=2`.
 
+## Kubernetes 5: Postgres
+
+`k8s/postgres/postgres.yaml`, applied with `k8s/setup.sh postgres`, in the `ecommerce` namespace:
+
+- **StatefulSet** `postgres` with one pod. A StatefulSet gives each pod a fixed name (`postgres-0`) and its own volume
+  from `volumeClaimTemplates`, which follows the pod when it is recreated. A Deployment would give a random name and
+  no volume of its own.
+- **Headless Service** `postgres` (`clusterIP: None`): the name resolves straight to the pod. Services and Debezium
+  connect to `postgres.ecommerce.svc:5432`.
+- `wal_level=logical` as an argument, as in Compose.
+- **Secret** `postgres` with the superuser password, created by the script with `kubectl create secret`, so no password
+  is written in a file. The services' own passwords are still in `init.sql`, as in Compose.
+- **ConfigMap** `postgres-init` made from `infra/postgres/init.sql` itself. Users and databases are defined once, for
+  both Compose and Kubernetes. The image runs it only when the volume is empty.
+
+A plain StatefulSet, not a Postgres operator such as CloudNativePG. An operator would add failover, backups and
+replicas, but also another pod, and nothing new for Kafka.
+
+**Observed:**
+
+- `order_db`, `inventory_db` and `payment_db` exist, with `order_service`, `inventory_service`, `payment_service` and
+  `debezium`, which has `REPLICATION`. `wal_level` is `logical`.
+- A pod in the namespace reached `postgres.ecommerce.svc:5432`: `accepting connections`.
+- The pod was deleted. A new pod with the same name `postgres-0` came up on the same volume, and a row written before
+  was still there. The test table was dropped afterwards.
+
