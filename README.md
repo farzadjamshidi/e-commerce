@@ -2787,3 +2787,29 @@ operator derives all of it, and the replication and controller ports (9091, 9090
 - No topics yet.
 - Memory: about 3.2 GiB for the three nodes together.
 
+## Kubernetes 4: topics as KafkaTopic resources
+
+`k8s/kafka/topics.yaml` holds the same 15 topics as `infra/setup.sh topics`: five saga topics, four DLTs and six
+compacted heartbeat topics. `k8s/setup.sh kafka` applies them after the cluster is ready.
+
+A resource name may not contain `_`, so the heartbeat topics use `topicName` for the real name, for example resource
+`debezium-heartbeat.order-db` and topic `__debezium-heartbeat.order-db`.
+
+**The resource is the source of truth, not Kafka.** Tested on `orders`:
+
+| Change | Result |
+|---|---|
+| `retention.ms=60000` set with `kafka-configs.sh` | reverted by the operator after 126 s |
+| `retention.ms` added to the `KafkaTopic` | in Kafka after 1 s |
+| `retention.ms` removed from the `KafkaTopic` | gone from Kafka after 2 s |
+
+A change to the resource is applied at once, because the operator watches it. A change made in Kafka is found at the
+next full reconciliation, every two minutes by default, and is overwritten. So topic changes go through Git and a
+review like any other code, and a quick fix by hand does not survive.
+
+Deleting a `KafkaTopic` deletes the topic and its data. Some changes cannot be undone even by the operator: Kafka can
+add partitions but never remove them.
+
+**Observed:** all 15 `KafkaTopic` resources `Ready`, all 15 topics listed by `kafka-topics.sh`. `payments` has 3
+partitions with leaders 0, 1 and 2, each replicated to all three brokers, and `min.insync.replicas=2`.
+

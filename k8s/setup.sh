@@ -3,7 +3,7 @@
 #
 #   k8s/setup.sh cluster    kind cluster with one control plane and two workers
 #   k8s/setup.sh strimzi    the Strimzi operator, in the kafka namespace
-#   k8s/setup.sh kafka      the Kafka cluster, three nodes in KRaft mode
+#   k8s/setup.sh kafka      the Kafka cluster, three nodes in KRaft mode, and its topics
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -31,6 +31,8 @@ strimzi() {
 kafka() {
   kubectl apply -f k8s/kafka/kafka-cluster.yaml
   kubectl -n kafka wait kafka/ecommerce --for=condition=Ready --timeout=600s
+  kubectl apply -f k8s/kafka/topics.yaml
+  kubectl -n kafka wait kafkatopic --all --for=condition=Ready --timeout=120s
 }
 
 case "${1:-}" in

@@ -1,0 +1,187 @@
+# The same topics as infra/setup.sh topics. The topic operator creates them, and changes them back
+# if someone edits them in Kafka directly: these resources are the source of truth.
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: orders
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: inventory
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payments
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: inventory-commands
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payment-commands
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+# Spring's dead letter publisher keeps the partition number, so a DLT needs as many partitions as its topic
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: inventory-commands-dlt
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payment-commands-dlt
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: inventory-dlt
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payments-dlt
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  partitions: 3
+  replicas: 3
+---
+# Debezium heartbeats. A resource name cannot contain underscores, so topicName holds the real name.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: debezium-heartbeat.order-db
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  topicName: __debezium-heartbeat.order-db
+  partitions: 1
+  replicas: 3
+  config:
+    cleanup.policy: compact
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: order-db.public.debezium-heartbeat
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  topicName: order-db.public.debezium_heartbeat
+  partitions: 1
+  replicas: 3
+  config:
+    cleanup.policy: compact
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: debezium-heartbeat.inventory-db
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  topicName: __debezium-heartbeat.inventory-db
+  partitions: 1
+  replicas: 3
+  config:
+    cleanup.policy: compact
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: inventory-db.public.debezium-heartbeat
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  topicName: inventory-db.public.debezium_heartbeat
+  partitions: 1
+  replicas: 3
+  config:
+    cleanup.policy: compact
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: debezium-heartbeat.payment-db
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  topicName: __debezium-heartbeat.payment-db
+  partitions: 1
+  replicas: 3
+  config:
+    cleanup.policy: compact
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: payment-db.public.debezium-heartbeat
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ecommerce
+spec:
+  topicName: payment-db.public.debezium_heartbeat
+  partitions: 1
+  replicas: 3
+  config:
+    cleanup.policy: compact
