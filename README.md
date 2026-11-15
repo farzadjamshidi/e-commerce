@@ -2749,3 +2749,41 @@ Strimzi 1.3.1 supports Kafka 4.2.x and 4.3.x, not the 4.1.0 used in Compose. The
 **Observed:** the operator pod `Running` on `ecommerce-worker2`, image `quay.io/strimzi/operator:1.3.1`, with the log
 line `Cluster Operator verticle started in namespace kafka`.
 
+## Kubernetes 3: a Kafka cluster from two resources
+
+`k8s/kafka/kafka-cluster.yaml`, applied with `k8s/setup.sh kafka`:
+
+- `KafkaNodePool` `dual-role`: three nodes, each controller and broker, like the Compose setup. Each gets a 2 GiB
+  volume that holds both the data and the KRaft metadata. The heap is 384 MiB and the memory limit 768 MiB, so the
+  cluster fits on a laptop.
+- `Kafka` `ecommerce`: version 4.2.2, the same as the services' clients. One listener, `plain` on port 9092, inside the
+  cluster only. The broker config is the one from Compose: replication factor 3, `min.insync.replicas` 2, no
+  auto-created topics.
+- `entityOperator.topicOperator` is the part that will turn `KafkaTopic` resources into topics.
+
+**What the operator made from these two resources:**
+
+| Created | Purpose |
+|---|---|
+| `StrimziPodSet` `ecommerce-dual-role` and pods `-0`, `-1`, `-2` | the brokers |
+| PVCs `data-0-ecommerce-dual-role-*`, 2 GiB each | one volume per broker, from kind's `standard` storage class |
+| Service `ecommerce-kafka-bootstrap` | the address clients use: `ecommerce-kafka-bootstrap.kafka.svc:9092` |
+| Service `ecommerce-kafka-brokers` | headless, gives every broker its own DNS name, for clients and the quorum |
+| Secrets with a cluster CA and client CA | TLS between brokers and for the controller quorum, without being asked |
+| `PodDisruptionBudget` `ecommerce-kafka`, `minAvailable: 2` | Kubernetes may not drain a node if fewer than two brokers would stay |
+| `NetworkPolicy` | only the right pods reach the internal ports |
+| pod `ecommerce-entity-operator` | the topic operator |
+
+Compose needed three service blocks with listeners, quorum voters and advertised addresses written by hand. Here the
+operator derives all of it, and the replication and controller ports (9091, 9090) use TLS.
+
+**Observed:**
+
+- `Kafka` `Ready` after about two minutes. Status: version 4.2.2, metadata version `4.2-IV1`, bootstrap
+  `ecommerce-kafka-bootstrap.kafka.svc:9092`.
+- The quorum has three voters, leader 1.
+- Brokers 0 and 2 run on `ecommerce-worker`, broker 1 on `ecommerce-worker2`. Losing `ecommerce-worker` would take two
+  of three brokers, so `min.insync.replicas` 2 could no longer be met. Two workers are a limit of this laptop setup.
+- No topics yet.
+- Memory: about 3.2 GiB for the three nodes together.
+
