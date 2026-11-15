@@ -3163,3 +3163,85 @@ rebalance can wait for that consumer.
 
 Afterwards the delay was removed, order and payment were scaled back to 1, and an order ended `CONFIRMED`.
 
+## Kubernetes summary
+
+The whole system runs on a local kind cluster: the saga gives the same results as on Docker Compose, a broker can be
+killed or the brokers restarted under load without losing an order, and inventory scales with its lag.
+
+**What runs where:**
+
+| Namespace | What | Kubernetes resources |
+|---|---|---|
+| `kafka` | Strimzi operator | Deployment, from the 1.3.1 release file |
+| `kafka` | Kafka 4.2.2, 3 nodes, KRaft | `Kafka`, `KafkaNodePool` |
+| `kafka` | 15 topics | `KafkaTopic` |
+| `kafka` | Debezium on Kafka Connect | `KafkaConnect`, 3 `KafkaConnector`, own image |
+| `kafka` | Schema Registry | Deployment, Service |
+| `ecommerce` | Postgres with 3 databases | StatefulSet, headless Service, Secret, ConfigMap |
+| `ecommerce` | order, inventory, payment | Deployments, own images, NodePort for order |
+| `ecommerce` | autoscaling of inventory | `ScaledObject`, and the HPA KEDA makes from it |
+| `keda` | KEDA 2.21.0 | Deployments, from the release file |
+
+`k8s/setup.sh` builds it all in eight commands, listed in Kubernetes 10, plus `keda`.
+
+**Compose and Kubernetes side by side:**
+
+| Concern | Docker Compose | Kubernetes |
+|---|---|---|
+| Kafka brokers | three service blocks, listeners and quorum written by hand | two resources, the operator derives the rest |
+| TLS between brokers | none | made by the operator, unasked |
+| Topics | `infra/setup.sh topics`, a script run once | `KafkaTopic`, kept in step; a change by hand is undone |
+| Connectors | `curl` with JSON files | `KafkaConnector`, owned by the operator |
+| Services | `java -jar` on the laptop | images, Deployments, probes |
+| Configuration | `application.yml` | same image, environment variables per environment |
+| A dead process | stays dead | restarted; a broker comes back on its own volume |
+| Changing a broker setting | restart by hand | rolling restart, one broker at a time, the leader last |
+| More consumers | start another process by hand | KEDA, from the lag |
+| Memory | about 3.5 GiB | about 6 GiB, the nodes and operators cost extra |
+| To start | one command | eight steps in order |
+
+Compose stays the tool for development: one command and less memory. Kubernetes earns its cost once something must
+keep running without a person watching it.
+
+**Findings:**
+
+1. A broker memory limit sized for the quiet state turned one broker crash into two: the survivor was OOMKilled while
+   taking over. With two of three down, `min.insync.replicas=2` stopped all writes, and orders took up to 18.8 s.
+   With 1 GiB instead of 768 MiB, the same test added at most 1 s. A survivor peaked at 859 MiB.
+2. A rolling restart is invisible and a crash is not. A broker that is restarted moves its leadership away first; a
+   killed one leaves its partitions without a leader until the controller acts.
+3. No order was lost in any test: the API writes only to Postgres, and the outbox waits in the WAL. Outages became
+   delays.
+4. Outbox rows written before their connector exists are lost for good: the row is deleted at once and no slot keeps
+   the WAL. The saga's timeouts repaired the one affected order by themselves.
+5. The topic operator undid a config change made with `kafka-configs.sh` after 126 s. A change to the resource took
+   1 s.
+6. Kubernetes adds `SCHEMA_REGISTRY_PORT` for a Service named `schema-registry`, and the image fails on it.
+   `enableServiceLinks: false` fixes it. The failing rollout never took the old pod down.
+7. New consumers from KEDA had no partitions for over three minutes, because one batch of 500 slow records had to
+   finish first. With `max.poll.records` 20 they had them at once.
+8. KEDA went to 4 replicas for 3 partitions although it is documented not to. `maxReplicaCount` equals the partition
+   count now.
+9. With two workers, brokers 0 and 2 share a node. Losing that node would stop writes. Real clusters spread brokers
+   over machines or zones.
+10. Docker Desktop stopping by itself was its idle shutdown, not a lack of memory.
+
+**Known gaps:**
+
+- Passwords: the services' in `init.sql`, Debezium's in the connector resources. A real setup uses Secrets, with
+  Strimzi's config provider for the connectors.
+- One Postgres pod, no replica or backup. An operator such as CloudNativePG would add them.
+- No Prometheus, Grafana or Jaeger in the cluster, and tracing is off there.
+- Images are copied into the nodes with `kind load`, not pulled from a registry, and every change needs a new build
+  and load.
+- No NetworkPolicy for the application namespace: any pod can reach Postgres.
+
+**For an interview:**
+
+- An operator encodes what a person would do to run Kafka: restarts in a safe order, certificates, upgrades. Use one
+  for stateful systems, and plain Deployments for stateless services.
+- Size memory for the failover, not for the quiet state.
+- Scale consumers on lag, not CPU, never beyond the partition count, and keep a batch short enough that a new consumer
+  gets work quickly.
+- With an outbox, a broker outage delays messages but loses none.
+
