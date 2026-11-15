@@ -21,15 +21,16 @@ spec:
         deleteClaim: true
         # KRaft metadata lives on this volume, next to the data
         kraftMetadata: shared
-  # Small, so three brokers fit next to the rest on a laptop
+  # Small, so three brokers fit next to the rest on a laptop. The limit leaves room outside the heap: with 768Mi a
+  # broker was OOMKilled while taking over the partitions of a broker that had died.
   jvmOptions:
     -Xms: 384m
     -Xmx: 384m
   resources:
     requests:
-      memory: 768Mi
+      memory: 1Gi
     limits:
-      memory: 768Mi
+      memory: 1Gi
 ---
 apiVersion: kafka.strimzi.io/v1
 kind: Kafka

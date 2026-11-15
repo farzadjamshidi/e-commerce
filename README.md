@@ -3042,3 +3042,49 @@ network buffers, which grow when it takes over partitions and connections from a
 
 The lesson: a memory limit sized for the quiet state turns one failure into two. The next step raises it.
 
+## Kubernetes 12: a rolling update, and the broker kill again
+
+The memory limit of the brokers went from 768 MiB to 1 GiB in `KafkaNodePool`, heap unchanged at 384 MiB. The change
+was applied while 300 orders were being placed, one every 0.5 s.
+
+**The rolling update.** The operator logged `Pod resource configuration changed` and replaced the brokers one at a
+time, each only after the one before was ready again:
+
+| After apply | Event |
+|---|---|
+| 5 s | broker 0 replaced |
+| 26 s | broker 0 ready |
+| 30 s | broker 1 replaced |
+| 51 s | broker 1 ready |
+| 55 s | broker 2, the quorum leader, replaced last |
+| 77 s | broker 2 ready |
+
+A replaced broker shuts down cleanly: it hands its partition leadership to the others before it stops. So the
+update cost nothing visible:
+
+| Created | Orders | Average | Slowest |
+|---|---|---|---|
+| before the update | 18 | 2.8 s | 3.9 s |
+| during the update | 149 | 2.1 s | 5.8 s |
+| after it | 133 | 2.2 s | 5.2 s |
+
+All 300 `CONFIRMED`, 300 reservations and payments, every HTTP call `202`, no DLT record, no duplicate.
+
+**The kill again.** Same test as Kubernetes 11, force deleting the quorum leader, this time broker 0:
+
+| Created | Orders | 768 MiB: average / slowest | 1 GiB: average / slowest |
+|---|---|---|---|
+| before the kill | 25 | 2.3 s / 3.1 s | 2.1 s / 3.2 s |
+| in the 25 s after it | 48 | 8.6 s / 18.8 s | 2.3 s / 4.0 s |
+| after recovery | 27 | 2.9 s / 6.3 s | 2.1 s / 2.9 s |
+
+All 100 `CONFIRMED`, no broker restarted except the one killed, nothing on a DLT. Broker 2 became quorum leader and
+broker 0 was back after 24 s. The surviving broker 1 peaked at 859 MiB, more than the old limit of 768 MiB: with the
+old limit it would have been killed too.
+
+**A crash and a planned restart differ.** A killed broker gives nothing back: its partitions have no leader until the
+controller notices and chooses new ones, and clients must retry. A restarted broker moves its leadership away first.
+That is why a rolling update was invisible here, and a crash added up to a second or two.
+
+Memory of the three kind nodes after the test: about 5.9 GiB of 7.7 GiB.
+
