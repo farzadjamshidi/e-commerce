@@ -2959,3 +2959,49 @@ The outbox row is deleted in its own transaction, and without a replication slot
 connector exists never reaches Kafka. In Compose the connectors were registered right after the first start for this
 reason. The saga's timeout will compensate this order once the connectors run.
 
+## Kubernetes 10: connectors as KafkaConnector resources, and the saga runs
+
+`k8s/debezium/connectors.yaml` holds the three connectors of `infra/debezium/*.json` as `KafkaConnector` resources,
+applied with `k8s/setup.sh connectors`. `connector.class` and `tasks.max` become `spec.class` and `spec.tasksMax`; the
+rest is the same config, except `database.hostname`, which is `postgres.ecommerce.svc`. The label
+`strimzi.io/cluster: debezium` says which `KafkaConnect` runs them.
+
+The order matters, as in Compose: the services must have started once, so that Flyway has created the outbox tables
+and the publications, and only then the connectors.
+
+**The full reset is now:**
+
+```bash
+k8s/setup.sh cluster
+k8s/setup.sh strimzi
+k8s/setup.sh kafka
+k8s/setup.sh postgres
+k8s/setup.sh connect
+k8s/setup.sh registry
+k8s/setup.sh services
+k8s/setup.sh connectors
+```
+
+The database password of Debezium is still written in the resource, as it was in the JSON files. Strimzi can read it
+from a Secret through a Kafka config provider, which a real setup would use.
+
+**Observed:**
+
+| Order | Result |
+|---|---|
+| success | `CONFIRMED` in 3.5 s |
+| payment over the limit | `CANCELLED` in 5.7 s, after the stock was released |
+| no stock | `CANCELLED` in 0.8 s |
+| the order placed before any connector existed | `CANCELLED` |
+
+- The three connectors `RUNNING`, each with an active replication slot.
+- Stock `9/1`: one unit held by the confirmed order. Payments `COMPLETED` and `FAILED`.
+- All four DLTs empty.
+
+The last order shows the saga's timeout doing its job. Its `ReserveStock` was lost, so the saga timed out and sent
+`ReleaseStock`, which was lost too while no connector ran. The release timeout resends it every 30 s, and once the
+connectors ran, one copy arrived. Inventory had nothing to release, answered `StockReleased`, and the order was
+cancelled. Nobody had to touch it.
+
+These times are one order each, not a measurement.
+

@@ -8,6 +8,7 @@
 #   k8s/setup.sh connect    Kafka Connect with the Debezium Postgres connector
 #   k8s/setup.sh registry   Schema Registry, and the schemas registered by the build
 #   k8s/setup.sh services   images of the three services, and their Deployments
+#   k8s/setup.sh connectors the Debezium connectors, after the services have created the publications
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -82,6 +83,11 @@ services() {
   done
 }
 
+connectors() {
+  kubectl apply -f k8s/debezium/connectors.yaml
+  kubectl -n kafka wait kafkaconnector --all --for=condition=Ready --timeout=180s
+}
+
 case "${1:-}" in
   cluster) cluster ;;
   strimzi) strimzi ;;
@@ -90,5 +96,6 @@ case "${1:-}" in
   connect) connect ;;
   registry) registry ;;
   services) services ;;
-  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect|registry|services" >&2; exit 1 ;;
+  connectors) connectors ;;
+  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect|registry|services|connectors" >&2; exit 1 ;;
 esac
