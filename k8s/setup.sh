@@ -7,6 +7,7 @@
 #   k8s/setup.sh postgres   Postgres with the three service databases, in the ecommerce namespace
 #   k8s/setup.sh connect    Kafka Connect with the Debezium Postgres connector
 #   k8s/setup.sh registry   Schema Registry, and the schemas registered by the build
+#   k8s/setup.sh services   images of the three services, and their Deployments
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -70,6 +71,17 @@ registry() {
   echo "registered schemas: $(curl -s localhost:8085/subjects)"
 }
 
+services() {
+  for service in order inventory payment; do
+    docker build -t "ecommerce/${service}-service:0.1" "${service}-service"
+    kind load docker-image "ecommerce/${service}-service:0.1" --name ecommerce
+    kubectl apply -f "k8s/services/${service}-service.yaml"
+  done
+  for service in order inventory payment; do
+    kubectl -n ecommerce rollout status "deployment/${service}-service" --timeout=300s
+  done
+}
+
 case "${1:-}" in
   cluster) cluster ;;
   strimzi) strimzi ;;
@@ -77,5 +89,6 @@ case "${1:-}" in
   postgres) postgres ;;
   connect) connect ;;
   registry) registry ;;
-  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect|registry" >&2; exit 1 ;;
+  services) services ;;
+  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect|registry|services" >&2; exit 1 ;;
 esac

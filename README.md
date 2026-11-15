@@ -2918,3 +2918,44 @@ dependencies stay the same, so a node that already has the old image pulls only 
 - `docker run` of the payment image started Spring Boot and stopped with `Connection to localhost:5432 refused`. The
   image works; the database address is configured per environment in the next step.
 
+## Kubernetes 9: the services as Deployments
+
+`k8s/services/` has one file per service. `k8s/setup.sh services` builds the three images, loads them into kind and
+applies the Deployments.
+
+**Configuration per environment.** The image is the same everywhere; what differs comes from environment variables.
+Spring Boot maps `SPRING_DATASOURCE_URL` to `spring.datasource.url`, `SCHEMAREGISTRY_URL` to `schema-registry.url`, and
+so on, over the values in `application.yml`:
+
+| Setting | Compose (application.yml) | Kubernetes |
+|---|---|---|
+| database | `localhost:5432` | `postgres.ecommerce.svc:5432` |
+| Kafka | `localhost:19092,...` | `ecommerce-kafka-bootstrap.kafka.svc:9092` |
+| Schema Registry | `localhost:8085` | `schema-registry.kafka.svc:8081` |
+| tracing | Jaeger on `localhost:4318` | off, no Jaeger in the cluster |
+
+**Probes.** On Kubernetes Spring Boot exposes `/actuator/health/liveness` and `/actuator/health/readiness`:
+
+- `startupProbe` gives the service up to two minutes to start, before the other probes count.
+- `livenessProbe` failing makes Kubernetes restart the container.
+- `readinessProbe` failing takes the pod out of its Service, without a restart, for example while it cannot reach the
+  database.
+
+order-service also has a `NodePort` Service on 30081, which `k8s/kind-config.yaml` maps to `localhost:8081`, so the
+API is called from the laptop as before. Inventory and payment have no Service: nothing calls them over HTTP.
+
+**Observed:**
+
+- All three pods `Running` and ready, with no `ERROR` in their logs.
+- Flyway ran in each database: order at version 10, inventory and payment at 6, each with `outbox_publication`.
+- order-service reached Kafka: cluster id `KTNoGPdpT9uRoG76m8h0dA` and all three brokers by their pod names.
+- Consumer groups `order-service`, `inventory-service` and `payment-service` exist.
+- `POST localhost:8081/orders` returned `PENDING`, and `/actuator/health` returned `UP`.
+- Memory of the three nodes: about 6 GiB of the 7.7 GiB given to Docker.
+
+**The order stays `PENDING`, and its messages are lost.** No Debezium connector exists yet, so nobody reads the WAL.
+The outbox row is deleted in its own transaction, and without a replication slot Postgres keeps no WAL for it. With
+`snapshot.mode: no_data`, a connector created later starts from the present. Anything written to an outbox before its
+connector exists never reaches Kafka. In Compose the connectors were registered right after the first start for this
+reason. The saga's timeout will compensate this order once the connectors run.
+

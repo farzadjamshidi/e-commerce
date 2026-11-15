@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: payment-service
+          # Built from payment-service/Dockerfile and loaded with kind load, see k8s/setup.sh
+          image: ecommerce/payment-service:0.1
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://postgres.ecommerce.svc:5432/payment_db
+            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
+              value: ecommerce-kafka-bootstrap.kafka.svc:9092
+            # No Jaeger in the cluster: no spans and no OTLP metrics are sent
+            - name: MANAGEMENT_TRACING_EXPORT_ENABLED
+              value: "false"
+            - name: MANAGEMENT_OTLP_METRICS_EXPORT_ENABLED
+              value: "false"
+          ports:
+            - containerPort: 8084
+          # Spring Boot exposes these groups when it runs on Kubernetes
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8084
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8084
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8084
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: 512Mi
+            limits:
+              memory: 512Mi
