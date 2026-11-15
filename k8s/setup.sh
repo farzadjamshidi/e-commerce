@@ -9,11 +9,13 @@
 #   k8s/setup.sh registry   Schema Registry, and the schemas registered by the build
 #   k8s/setup.sh services   images of the three services, and their Deployments
 #   k8s/setup.sh connectors the Debezium connectors, after the services have created the publications
+#   k8s/setup.sh keda       KEDA, and the autoscaling of inventory-service by consumer lag
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 STRIMZI_VERSION=1.3.1
+KEDA_VERSION=2.21.0
 
 cluster() {
   if kind get clusters | grep -qx ecommerce; then
@@ -88,6 +90,15 @@ connectors() {
   kubectl -n kafka wait kafkaconnector --all --for=condition=Ready --timeout=180s
 }
 
+keda() {
+  # The core file has the operator and the metrics server, without the admission webhooks
+  curl -sfL "https://github.com/kedacore/keda/releases/download/v${KEDA_VERSION}/keda-${KEDA_VERSION}-core.yaml" \
+    | kubectl apply --server-side -f -
+  kubectl -n keda rollout status deployment/keda-operator --timeout=300s
+  kubectl -n keda rollout status deployment/keda-metrics-apiserver --timeout=300s
+  kubectl apply -f k8s/keda/inventory-scaledobject.yaml
+}
+
 case "${1:-}" in
   cluster) cluster ;;
   strimzi) strimzi ;;
@@ -97,5 +108,6 @@ case "${1:-}" in
   registry) registry ;;
   services) services ;;
   connectors) connectors ;;
-  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect|registry|services|connectors" >&2; exit 1 ;;
+  keda) keda ;;
+  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect|registry|services|connectors|keda" >&2; exit 1 ;;
 esac

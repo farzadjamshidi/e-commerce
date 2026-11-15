@@ -1,0 +1,25 @@
+# Scales inventory-service by the lag of its consumer group on inventory-commands.
+# KEDA creates and drives a HorizontalPodAutoscaler for the Deployment.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: inventory-service
+  namespace: ecommerce
+spec:
+  scaleTargetRef:
+    name: inventory-service
+  minReplicaCount: 1
+  # inventory-commands has 3 partitions, and a fourth consumer in the group gets none. The Kafka scaler is meant to
+  # stop at the partition count by itself, but in a test with 5 here it went to 4, so the limit is set explicitly.
+  maxReplicaCount: 3
+  # Short for the demo; the defaults are 30 s and 300 s
+  pollingInterval: 10
+  cooldownPeriod: 60
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: ecommerce-kafka-bootstrap.kafka.svc:9092
+        consumerGroup: inventory-service
+        topic: inventory-commands
+        # Target lag per replica: 200 waiting records ask for two pods
+        lagThreshold: "100"

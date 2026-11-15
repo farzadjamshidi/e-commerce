@@ -4,7 +4,7 @@ metadata:
   name: inventory-service
   namespace: ecommerce
 spec:
-  replicas: 1
+  # No replicas: KEDA sets them. A fixed number here would undo its choice at every apply.
   selector:
     matchLabels:
       app: inventory-service

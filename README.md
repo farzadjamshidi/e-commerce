@@ -3088,3 +3088,50 @@ That is why a rolling update was invisible here, and a crash added up to a secon
 
 Memory of the three kind nodes after the test: about 5.9 GiB of 7.7 GiB.
 
+## Kubernetes 13: KEDA scales inventory by consumer lag
+
+KEDA 2.21.0 is installed with `k8s/setup.sh keda`, from its `core` release file: the operator and a metrics server in
+namespace `keda`. `k8s/keda/inventory-scaledobject.yaml` is a `ScaledObject` for inventory-service with a `kafka`
+trigger on group `inventory-service` and topic `inventory-commands`, a target lag of 100 per replica, and 1 to 3
+replicas. KEDA turns it into a HorizontalPodAutoscaler, `keda-hpa-inventory-service`, and feeds it the lag as an
+external metric.
+
+A CPU-based autoscaler sees the wrong thing for a consumer: a consumer that waits on a database can be slow with idle
+CPU. Lag says directly how much work is waiting.
+
+The inventory Deployment no longer sets `replicas`. With an autoscaler in charge, a fixed number in the file would
+reset its choice at every `kubectl apply`.
+
+**The test.** order-service and payment-service were scaled to 0 to make room in memory. Inventory was slowed to
+200 ms per record with `INVENTORY_PROCESSING_DELAY_MS`. 3000 records without headers were written to
+`inventory-commands`; inventory waits, then skips them, so nothing in the database changes. The scaled object allowed
+up to 5 replicas for this test.
+
+| Time | Replicas | Lag | Members with partitions |
+|---|---|---|---|
+| +13 s | 1 | 2979 | 1 |
+| +25 s | 3 wanted | 2923 | 1 |
+| +37 s | 3 ready | 2868 | 1 |
+| +220 s | 3 | 2000 | 1 |
+| +231 s | 3 | 1940 | 3 |
+| +392 s | 4 | 380 | 3 |
+| +474 s | 4 | 0 | 3 |
+| about 5 min later | 3, 2, 1 | 0 | |
+
+**Scaling up was fast, sharing the work was not.** KEDA asked for three pods within 25 s and they were ready at 37 s.
+For more than three minutes after that, one consumer still held all three partitions. The likely cause is the batch
+size: `max.poll.records` is 500, so at 200 ms per record one poll's batch takes up to 100 s, and a consumer gives up a
+partition only between polls. This was not tested by changing the setting. For a slow consumer, a small
+`max.poll.records` lets new instances take part much sooner.
+
+**A fourth pod got no work.** Near the end the HPA went to 4 replicas while only three members had partitions. The
+Kafka scaler is documented to stop at the partition count unless `allowIdleConsumers` is on; why it did not here was
+not found. The scaled object now says `maxReplicaCount: 3`, the partition count, instead of relying on it.
+
+**Scaling down waits.** Lag reached 0 at about +474 s, and the HPA removed one pod at a time about five minutes later.
+That is the HPA's default stabilization window for scale-down, which keeps a short dip in load from removing pods that
+would be needed again a moment later.
+
+Afterwards the delay was removed, order-service and payment-service scaled back to 1, and an order ended
+`CONFIRMED`.
+
