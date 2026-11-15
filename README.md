@@ -2787,3 +2787,30 @@ The group `order-service-status-592048dc-...` appeared next to `order-service`.
 An `ERROR` in the test log comes from the saga timeout job at the very end of the run: Testcontainers stops Postgres
 before Spring stops the scheduler. It does not affect any test.
 
+## SSE 4: two instances of order-service
+
+The case the broadcast listener exists for: a browser's stream is open on one instance, and the saga reply for its
+order is handled by the other.
+
+Two instances ran from the same jar, A on port 8081 and B on 8091 (`SERVER_PORT=8091`). In the shared group
+`order-service`, one held partitions 0 and 1 of `inventory` and `payments`, the other partition 2. Each had its own
+`order-service-status-...` group with one member.
+
+12 orders were placed through A. Their streams were opened on A and B in turn. The instance that handled each reply
+was read from the logs (`payment completed, confirmed` or `stock rejected`):
+
+| Stream on | Reply handled by | Orders | Stream showed |
+|---|---|---|---|
+| same instance | same instance | 6 | `PENDING`, then the final status |
+| one instance | the other | 6 | `PENDING`, then the final status |
+
+All 12 streams ended with their final status: 9 `CONFIRMED`, and 3 `CANCELLED` because `laptop-pro-14` ran out of
+stock in this Compose database. One of the cancelled orders was also cross-instance. A stream took between 1.5 s and
+10.5 s to end; the slow ones were not investigated.
+
+Without the broadcast listener, the six cross-instance streams would have shown `PENDING` until they timed out after
+60 s.
+
+The saga timeout job now runs on both instances. That is safe: a stuck saga moves only through the conditional
+`UPDATE ... WHERE state = :from`, so if both instances try, one changes the row and the other finds nothing to do.
+
