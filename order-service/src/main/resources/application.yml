@@ -7,6 +7,14 @@ spring:
   mvc:
     problemdetails:
       enabled: true
+  web:
+    resources:
+      cache:
+        # Files in the jar all carry the same fixed date, so Last-Modified never changes and a browser would keep
+        # the old page after a deploy. Without it, and with no-cache, the page is fetched again each time.
+        use-last-modified: false
+        cachecontrol:
+          no-cache: true
   datasource:
     url: jdbc:postgresql://localhost:5432/order_db
     username: order_service

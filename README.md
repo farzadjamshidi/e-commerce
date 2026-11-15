@@ -2814,3 +2814,40 @@ Without the broadcast listener, the six cross-instance streams would have shown 
 The saga timeout job now runs on both instances. That is safe: a stuck saga moves only through the conditional
 `UPDATE ... WHERE state = :from`, so if both instances try, one changes the row and the other finds nothing to do.
 
+## SSE 5: a page to watch the saga
+
+`order-service/src/main/resources/static/index.html` is served by order-service itself at `http://localhost:8081/`,
+so the page and the API share an origin and need no CORS. One file, no build step and no framework.
+
+- A form for product, quantity and price, and three shortcuts: a successful order, a payment over the 2000 EUR limit,
+  and a product without stock.
+- Each order becomes a card. The page posts the order, then opens an `EventSource` on `/orders/{id}/events` and shows
+  each status with the time since the click.
+
+**The page must close the stream itself.** After a final status the server completes the response. `EventSource` treats
+any end as a dropped connection and reconnects after about 3 s; the server then sends the final status again and
+closes again, forever. Tested on a finished order with an `EventSource` that was never closed: it reconnected 7 times
+in 20 s, every 3 s. The page calls `source.close()` on `CONFIRMED` or `CANCELLED`, and with it the three orders of a
+test opened exactly three streams.
+
+**A deployed page could stay old.** Spring Boot builds a reproducible jar, so every file inside has the same fixed
+date, and `Last-Modified` for `index.html` was `Fri, 01 Feb 1980`. A browser that had the page asked whether it had
+changed, got `304 Not Modified`, and kept the old version after a new deploy. This hid two style fixes during this
+step. `spring.web.resources.cache.use-last-modified: false` and `cachecontrol.no-cache: true` fix it: the same
+conditional request now gets `200` and the new page. A real site would rather put a content hash in file names and
+cache them for long.
+
+**Observed,** clicking the three shortcuts in headless Chrome through the DevTools protocol:
+
+| Shortcut | Card |
+|---|---|
+| Success | `PENDING` at 0.0 s, `CONFIRMED` at 3.6 s |
+| Payment over the limit | `PENDING` at 0.0 s, `CANCELLED` at 3.8 s |
+| No stock | `PENDING` at 0.0 s, `CANCELLED` at 1.5 s |
+
+The native `select` of Chrome was drawn wider than its grid column, over the next field. It now has `appearance: none`
+with a drawn arrow, and its label `min-width: 0`. Because of the cache problem above, it is not known which of the two
+was needed.
+
+The stock of `laptop-pro-14` in the Compose database was raised by 1000, as earlier tests had used it up.
+

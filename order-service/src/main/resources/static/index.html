@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order saga</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
+    --accent: #2f6fde; --pending: #b7791f; --pending-bg: #fdf6e7;
+    --confirmed: #1f8a4c; --confirmed-bg: #e8f6ee; --cancelled: #c0392b; --cancelled-bg: #fcecea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b2029; --text: #e6e9ef; --muted: #9aa3b2; --line: #2b3240;
+      --accent: #6c9cf0; --pending: #e0b25a; --pending-bg: #2e2717;
+      --confirmed: #5cc78a; --confirmed-bg: #17291f; --cancelled: #ef7a6c; --cancelled-bg: #321c1a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .lead { color: var(--muted); margin: 0 0 24px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  form { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; align-items: end; }
+  label { display: grid; gap: 4px; min-width: 0; font-size: 13px; color: var(--muted); }
+  input, select, button { font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--text); }
+  input, select { width: 100%; min-width: 0; }
+  /* The native select of Chrome drew past its own box; a plain one with a drawn arrow stays inside it */
+  select { appearance: none; padding-right: 28px;
+    background: var(--bg) no-repeat right 10px center / 10px 6px
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23889'/%3E%3C/svg%3E"); }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .presets span { color: var(--muted); font-size: 13px; align-self: center; }
+  h2 { font-size: 16px; margin: 28px 0 12px; }
+  #orders { display: grid; gap: 10px; }
+  .empty { color: var(--muted); }
+  .order { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; }
+  .order .what { font-weight: 600; }
+  .order .id { font: 12px ui-monospace, monospace; color: var(--muted); }
+  .badge { align-self: start; padding: 2px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+  .PENDING { color: var(--pending); background: var(--pending-bg); }
+  .CONFIRMED { color: var(--confirmed); background: var(--confirmed-bg); }
+  .CANCELLED { color: var(--cancelled); background: var(--cancelled-bg); }
+  .events { grid-column: 1 / -1; font-size: 13px; color: var(--muted); }
+  .error { color: var(--cancelled); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Order saga</h1>
+  <p class="lead">Place an order and watch its status arrive from the server as the saga runs.</p>
+
+  <div class="panel">
+    <form id="form">
+      <label>Product
+        <select name="sku">
+          <option value="laptop-pro-14">laptop-pro-14</option>
+          <option value="phone-x">phone-x</option>
+          <option value="headphones-z">headphones-z (no stock)</option>
+        </select>
+      </label>
+      <label>Quantity <input name="quantity" type="number" min="1" value="1"></label>
+      <label>Unit price, EUR <input name="unitPrice" type="number" min="0" step="0.01" value="10.00"></label>
+      <button class="primary" type="submit">Place order</button>
+    </form>
+    <div class="presets">
+      <span>Try:</span>
+      <button type="button" data-sku="laptop-pro-14" data-price="10.00">Success</button>
+      <button type="button" data-sku="laptop-pro-14" data-price="2500.00">Payment over the limit</button>
+      <button type="button" data-sku="headphones-z" data-price="10.00">No stock</button>
+    </div>
+  </div>
+
+  <h2>Orders</h2>
+  <div id="orders"><p class="empty">No orders yet.</p></div>
+</main>
+
+<script>
+  const FINAL = ['CONFIRMED', 'CANCELLED'];
+  const form = document.getElementById('form');
+  const list = document.getElementById('orders');
+
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const data = new FormData(form);
+    placeOrder(data.get('sku'), Number(data.get('quantity')), data.get('unitPrice'));
+  });
+
+  document.querySelectorAll('.presets button').forEach(button =>
+    button.addEventListener('click', () => placeOrder(button.dataset.sku, 1, button.dataset.price)));
+
+  async function placeOrder(sku, quantity, unitPrice) {
+    const card = addCard(`${quantity} × ${sku} at ${unitPrice} EUR`);
+    const startedAt = performance.now();
+    try {
+      const response = await fetch('/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ customerId: 'browser', sku, quantity, unitPrice, currency: 'EUR' })
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const order = await response.json();
+      card.id.textContent = order.orderId;
+      follow(order.orderId, card, startedAt);
+    } catch (error) {
+      card.events.innerHTML = `<span class="error">Not placed: ${error.message}</span>`;
+    }
+  }
+
+  // The server sends the current status first, then the final one, and closes the stream.
+  // EventSource would reconnect after that, so the page closes it itself on a final status.
+  function follow(orderId, card, startedAt) {
+    const source = new EventSource(`/orders/${orderId}/events`);
+    source.addEventListener('status', message => {
+      const { status } = JSON.parse(message.data);
+      const seconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+      card.badge.textContent = status;
+      card.badge.className = `badge ${status}`;
+      card.steps.push(`${status} at ${seconds} s`);
+      card.events.textContent = card.steps.join(' → ');
+      if (FINAL.includes(status)) {
+        source.close();
+      }
+    });
+    // On a dropped stream EventSource retries by itself, and the server answers with the current status
+    source.onerror = () => {
+      if (source.readyState === EventSource.CONNECTING) {
+        card.events.textContent = card.steps.join(' → ') + ' … reconnecting';
+      }
+    };
+  }
+
+  function addCard(what) {
+    list.querySelector('.empty')?.remove();
+    const element = document.createElement('div');
+    element.className = 'panel order';
+    element.innerHTML = `<div><div class="what"></div><div class="id">placing…</div></div>
+      <span class="badge PENDING">PENDING</span><div class="events"></div>`;
+    element.querySelector('.what').textContent = what;
+    list.prepend(element);
+    return {
+      id: element.querySelector('.id'),
+      badge: element.querySelector('.badge'),
+      events: element.querySelector('.events'),
+      steps: []
+    };
+  }
+</script>
+</body>
+</html>
