@@ -6,6 +6,7 @@
 #   k8s/setup.sh kafka      the Kafka cluster, three nodes in KRaft mode, and its topics
 #   k8s/setup.sh postgres   Postgres with the three service databases, in the ecommerce namespace
 #   k8s/setup.sh connect    Kafka Connect with the Debezium Postgres connector
+#   k8s/setup.sh registry   Schema Registry, and the schemas registered by the build
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -57,11 +58,24 @@ connect() {
   kubectl -n kafka wait kafkaconnect/debezium --for=condition=Ready --timeout=600s
 }
 
+registry() {
+  kubectl apply -f k8s/schema-registry/schema-registry.yaml
+  kubectl -n kafka rollout status deployment/schema-registry --timeout=300s
+  # The build registers schemas against localhost:8085, the same port as in Compose
+  kubectl -n kafka port-forward svc/schema-registry 8085:8081 >/dev/null &
+  local forward=$!
+  trap 'kill $forward' RETURN
+  until curl -sf localhost:8085/subjects >/dev/null; do sleep 1; done
+  (cd inventory-service && ./mvnw -q -B schema-registry:register)
+  echo "registered schemas: $(curl -s localhost:8085/subjects)"
+}
+
 case "${1:-}" in
   cluster) cluster ;;
   strimzi) strimzi ;;
   kafka) kafka ;;
   postgres) postgres ;;
   connect) connect ;;
-  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect" >&2; exit 1 ;;
+  registry) registry ;;
+  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect|registry" >&2; exit 1 ;;
 esac

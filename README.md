@@ -2867,3 +2867,24 @@ hand through the API would be removed.
 - From the Connect pod, `postgres.ecommerce.svc:5432` is reachable across namespaces. No connectors yet.
 - Memory of the three nodes together: about 4.7 GiB.
 
+## Kubernetes 7: Schema Registry
+
+`k8s/schema-registry/schema-registry.yaml`: a Deployment with one pod and a Service, in the `kafka` namespace. The
+registry keeps every schema in the topic `_schemas`, so the pod has no volume and can be replaced freely. A Deployment
+fits: unlike Postgres, nothing in the pod needs to survive it. Compatibility is `full_transitive`, as in Compose.
+
+`k8s/setup.sh registry` deploys it and then registers the schemas the same way as in Compose: a `kubectl port-forward`
+makes the registry reachable on `localhost:8085`, and the inventory build runs `schema-registry:register` against it.
+The forward is stopped when the script returns.
+
+**`enableServiceLinks: false` is required.** For every Service in a namespace, Kubernetes adds environment variables
+to each pod, for this one `SCHEMA_REGISTRY_PORT=tcp://...`. The image reads every `SCHEMA_REGISTRY_*` variable as its
+own setting. With service links on, the new pod went into `CrashLoopBackOff` with
+`PORT is deprecated. Please use SCHEMA_REGISTRY_LISTENERS instead.`
+
+The same test showed a rolling update protecting the service: the old pod kept running and serving while the new one
+crashed, because a Deployment removes an old pod only after a new one is ready.
+
+**Observed:** pod `Running`, compatibility `FULL_TRANSITIVE`, subject `com.ecommerce.inventory.StockReserved` version 1,
+topic `_schemas` with one partition, replication factor 3, compacted.
+
