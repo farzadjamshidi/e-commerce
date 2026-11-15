@@ -44,6 +44,9 @@ outbox:
     batch-size: 100
 
 order:
+  status-stream:
+    # How long a browser's status stream stays open; EventSource then reconnects and gets the current status
+    timeout: 60s
   saga-timeout:
     # A healthy step takes under a second; a saga still waiting after this is treated as stuck
     after: 30s

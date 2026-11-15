@@ -2709,3 +2709,44 @@ test, `sagaCancelsWhenStockIsRejected`, checks `OrderCreated, OrderCancelled`. A
 `CANCELLED` and `CANCELLED`. On `orders`, each had `OrderCreated` followed by its `OrderConfirmed` or `OrderCancelled`,
 with the order id as key, so both events of an order are in one partition, in order.
 
+## SSE 2: a status stream per order
+
+`GET /orders/{id}/events` answers with `text/event-stream`. The response stays open, and the server writes an event
+into it when it has news:
+
+```text
+event:status
+data:{"orderId":"2671a944-...","status":"CONFIRMED"}
+```
+
+A browser reads it with `EventSource`, which also reconnects by itself when the stream ends.
+
+**`OrderStatusStreams`** keeps the open streams of this instance, by order id, in memory. A stream is removed when it
+completes, times out or fails. Streams are only a notice: the database stays the truth.
+
+**The order of work when a browser connects:**
+
+1. 404 if the order does not exist.
+2. The stream is registered.
+3. The current status is read from the database and sent.
+4. If that status is final, `CONFIRMED` or `CANCELLED`, the stream is closed at once.
+
+Registering before reading matters. If the status were read first, an order that finished between the read and the
+registration would send its news to nobody, and the browser would wait with a stale `PENDING`.
+
+**Timeout.** A stream stays open for `order.status-stream.timeout`, 60 s. Then the browser's `EventSource` reconnects,
+and step 3 sends the current status again. So a stream that dropped, or a notice that never came, costs at most one
+reconnect. Delivery to the browser is at most once on purpose; the reconnect makes it good enough.
+
+**Observed:**
+
+- A finished order: one `CONFIRMED` event, stream closed after 0.02 s.
+- An unknown order id: 404.
+- A pending order, with inventory stopped so it could not finish: one `PENDING` event, then nothing until the stream
+  timed out after 60.5 s. Meanwhile the saga timed out and moved to `RELEASING_STOCK`, but the order stayed `PENDING`
+  and the stream had nothing to say.
+
+Nothing calls `OrderStatusStreams.send` for an order that changes while its stream is open yet. The change happens in
+the saga, possibly on another instance of order-service. The next step delivers it through Kafka. After inventory was
+started again, the pending order was cancelled by the saga, as before.
+

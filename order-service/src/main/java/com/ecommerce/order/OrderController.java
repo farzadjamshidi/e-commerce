@@ -13,6 +13,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -20,15 +21,18 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 @RestController
 @RequestMapping("/orders")
 class OrderController {
 
     private final OrderService orderService;
+    private final OrderStatusStreams orderStatusStreams;
 
-    OrderController(OrderService orderService) {
+    OrderController(OrderService orderService, OrderStatusStreams orderStatusStreams) {
         this.orderService = orderService;
+        this.orderStatusStreams = orderStatusStreams;
     }
 
     @PostMapping
@@ -45,6 +49,17 @@ class OrderController {
         return orderService.findOrder(id)
                 .map(order -> ResponseEntity.ok(OrderResponse.from(order)))
                 .orElse(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping(path = "/{id}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    ResponseEntity<SseEmitter> streamStatus(@PathVariable UUID id) {
+        if (orderService.findOrder(id).isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        // Registered before the status is read: a change in between is then sent, not lost
+        SseEmitter emitter = orderStatusStreams.open(id);
+        orderService.findOrder(id).ifPresent(order -> orderStatusStreams.send(emitter, id, order.getStatus()));
+        return ResponseEntity.ok(emitter);
     }
 
     record PlaceOrderRequest(
