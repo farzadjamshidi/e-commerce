@@ -14,6 +14,7 @@ class OrderSagaOrchestrator {
     private static final Logger log = LoggerFactory.getLogger(OrderSagaOrchestrator.class);
     private static final String INVENTORY_COMMANDS_TOPIC = "inventory-commands";
     private static final String PAYMENT_COMMANDS_TOPIC = "payment-commands";
+    private static final String ORDERS_TOPIC = "orders";
 
     private final OrderSagaRepository orderSagaRepository;
     private final OrderRepository orderRepository;
@@ -55,7 +56,7 @@ class OrderSagaOrchestrator {
             return;
         }
         // Nothing was reserved or charged, so there is nothing to compensate
-        orderRepository.completePending(orderId, OrderStatus.CANCELLED.name());
+        finish(orderId, OrderStatus.CANCELLED);
         log.info("Order {}: stock rejected ({}), cancelled", orderId, reason);
     }
 
@@ -64,7 +65,7 @@ class OrderSagaOrchestrator {
         if (!moved(orderId, SagaState.CHARGING_PAYMENT, SagaState.COMPLETED)) {
             return;
         }
-        orderRepository.completePending(orderId, OrderStatus.CONFIRMED.name());
+        finish(orderId, OrderStatus.CONFIRMED);
         log.info("Order {}: payment completed, confirmed", orderId);
     }
 
@@ -83,7 +84,7 @@ class OrderSagaOrchestrator {
         if (!moved(orderId, SagaState.RELEASING_STOCK, SagaState.CANCELLED)) {
             return;
         }
-        orderRepository.completePending(orderId, OrderStatus.CANCELLED.name());
+        finish(orderId, OrderStatus.CANCELLED);
         log.info("Order {}: stock released, cancelled", orderId);
     }
 
@@ -132,6 +133,14 @@ class OrderSagaOrchestrator {
         if (moved(orderId, SagaState.REFUNDING_PAYMENT, SagaState.REFUNDING_PAYMENT)) {
             sendRefundPayment(orderId);
             log.warn("Order {}: still no PaymentRefunded, sending RefundPayment again", orderId);
+        }
+    }
+
+    // The order's final status and its event commit together, so the event is never sent for a change that rolled back
+    private void finish(UUID orderId, OrderStatus status) {
+        if (orderRepository.completePending(orderId, status.name()) == 1) {
+            OrderFinishedEvent event = OrderFinishedEvent.of(orderId, status);
+            outboxWriter.write(event.eventId(), ORDERS_TOPIC, orderId, event.eventType(), event, event.occurredAt());
         }
     }
 

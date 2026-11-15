@@ -130,6 +130,18 @@ class OrderSagaIntegrationTest {
         awaitAllHandled();
         assertThat(sagaState(orderId)).isEqualTo("COMPLETED");
         assertThat(orderStatus(orderId)).isEqualTo("CONFIRMED");
+        assertThat(sentEvents(orderId)).containsExactly("OrderCreated", "OrderConfirmed");
+    }
+
+    @Test
+    void sagaCancelsWhenStockIsRejected() throws Exception {
+        UUID orderId = placeOrder();
+
+        reply("inventory", orderId, StockReply.REJECTED, UUID.randomUUID());
+        awaitAllHandled();
+
+        assertThat(orderStatus(orderId)).isEqualTo("CANCELLED");
+        assertThat(sentEvents(orderId)).containsExactly("OrderCreated", "OrderCancelled");
     }
 
     @Test
@@ -152,6 +164,7 @@ class OrderSagaIntegrationTest {
         assertThat(sagaState(orderId)).isEqualTo("COMPLETED");
         assertThat(orderStatus(orderId)).isEqualTo("CONFIRMED");
         assertThat(sentCommands(orderId)).containsExactly("ReserveStock", "ChargePayment");
+        assertThat(sentEvents(orderId)).containsExactly("OrderCreated", "OrderConfirmed");
     }
 
     // The inventory listener reads bytes, so its dead letters need a bytes serializer. With the default string
@@ -199,6 +212,11 @@ class OrderSagaIntegrationTest {
     private List<String> sentCommands(UUID orderId) {
         return jdbc.queryForList("""
                 SELECT event_type FROM sent_messages WHERE aggregate_id = ? AND destination LIKE '%-commands'""",
+                String.class, orderId.toString());
+    }
+
+    private List<String> sentEvents(UUID orderId) {
+        return jdbc.queryForList("SELECT event_type FROM sent_messages WHERE aggregate_id = ? AND destination = 'orders'",
                 String.class, orderId.toString());
     }
 

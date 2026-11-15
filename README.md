@@ -2679,3 +2679,33 @@ Version 2 was a test change. The file is back to the original and version 2 was 
 **Why this order matters.** A schema now reaches the registry only after a compatibility check, and a service cannot
 write a message with a schema that is not there. The check happens at build time, before any message exists.
 
+## SSE 1: the end of an order is published
+
+The plan for live order status in the browser:
+
+1. `OrderConfirmed` and `OrderCancelled` on the `orders` topic. (this step)
+2. `GET /orders/{id}/events` with `SseEmitter`, for one instance.
+3. A broadcast listener: every instance of order-service reads every event, with its own consumer group.
+4. A test with two instances: the browser on one, the saga reply handled by the other.
+5. A small frontend.
+
+Until now `orders` carried only `OrderCreated`, and nothing read it. A browser connected to one instance of
+order-service needs to hear about an order that another instance finished. That needs an event, and the outbox is the
+place for it.
+
+**What changed.** `OrderSagaOrchestrator` had three places that set the final status. They now call one method,
+`finish`, which sets the status and writes `OrderFinishedEvent` to the outbox, in the same transaction and only if the
+status really changed from `PENDING`. A rolled back change never sends an event, and a repeated reply never sends a
+second one.
+
+`OrderFinishedEvent` has `eventId`, `eventType` (`OrderConfirmed` or `OrderCancelled`), `occurredAt`, `orderId` and
+`status`. The saga does not need it; it is for whoever shows the order.
+
+**Tests.** The order-service test now also checks the events on `orders`, using the trigger copy of the outbox:
+`OrderCreated, OrderConfirmed` for a successful order, and the repeated replies add no second `OrderConfirmed`. A new
+test, `sagaCancelsWhenStockIsRejected`, checks `OrderCreated, OrderCancelled`. All 4 tests pass.
+
+**Observed on Compose:** a successful order, a payment over the limit and an order without stock ended `CONFIRMED`,
+`CANCELLED` and `CANCELLED`. On `orders`, each had `OrderCreated` followed by its `OrderConfirmed` or `OrderCancelled`,
+with the order id as key, so both events of an order are in one partition, in order.
+
