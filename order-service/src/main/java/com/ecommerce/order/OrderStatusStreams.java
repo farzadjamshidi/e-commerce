@@ -41,6 +41,10 @@ class OrderStatusStreams {
         return emitter;
     }
 
+    boolean isOpen(UUID orderId) {
+        return streams.containsKey(orderId);
+    }
+
     void send(UUID orderId, OrderStatus status) {
         Set<SseEmitter> emitters = streams.get(orderId);
         if (emitters != null) {

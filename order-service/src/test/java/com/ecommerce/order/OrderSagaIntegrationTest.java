@@ -19,21 +19,30 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.KafkaAdmin;
+import org.springframework.kafka.test.utils.ContainerTestUtils;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.math.BigDecimal;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 
@@ -42,7 +51,8 @@ import static org.awaitility.Awaitility.await;
 
 // The replies of inventory and payment are sent by the test. Debezium is not part of it.
 // mock:// is an in-memory Schema Registry, shared by every client in this JVM that uses the same name
-@SpringBootTest(properties = {"management.tracing.export.enabled=false", "schema-registry.url=mock://order-test"})
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = {"management.tracing.export.enabled=false", "schema-registry.url=mock://order-test"})
 @Testcontainers
 class OrderSagaIntegrationTest {
 
@@ -66,12 +76,21 @@ class OrderSagaIntegrationTest {
     @Autowired
     OrderService orderService;
 
+    @Autowired
+    OrderStatusStreams orderStatusStreams;
+
 
     @Autowired
     JdbcTemplate jdbc;
 
     @Autowired
     KafkaAdmin kafkaAdmin;
+
+    @Autowired
+    KafkaListenerEndpointRegistry listenerRegistry;
+
+    @LocalServerPort
+    int port;
 
     // The outbox row is deleted in its own transaction, so a trigger keeps a copy of everything the service sends
     KafkaProducer<String, byte[]> producer;
@@ -182,6 +201,33 @@ class OrderSagaIntegrationTest {
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(endOffset("inventory-dlt")).isEqualTo(dltBefore.get("inventory") + 1));
         assertThat(sagaState(orderId)).isEqualTo("RESERVING_STOCK");
+    }
+
+    // The browser's view: a stream opened while the order is pending must also show how it ends. The event is
+    // written to orders by the test, as Debezium would, and reaches the stream through the broadcast listener.
+    @Test
+    void statusStreamShowsTheEndOfAnOrder() throws Exception {
+        UUID orderId = placeOrder();
+        // The broadcast listener starts at the end of the topic, so it must be in place before the event is sent
+        ContainerTestUtils.waitForAssignment(listenerRegistry.getListenerContainer("order-status-stream"), 1);
+
+        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/orders/" + orderId
+                + "/events")).header("Accept", "text/event-stream").build();
+        CompletableFuture<List<String>> events = HttpClient.newHttpClient()
+                .sendAsync(request, HttpResponse.BodyHandlers.ofLines())
+                .thenApply(response -> response.body().filter(line -> line.startsWith("data:")).toList());
+
+        await().atMost(Duration.ofSeconds(10)).until(() -> orderStatusStreams.isOpen(orderId));
+        ProducerRecord<String, byte[]> record = new ProducerRecord<>("orders", orderId.toString(), """
+                {"eventId":"%s","eventType":"OrderConfirmed","occurredAt":"2026-01-01T00:00:00Z","orderId":"%s",\
+                "status":"CONFIRMED"}""".formatted(UUID.randomUUID(), orderId).getBytes(StandardCharsets.UTF_8));
+        record.headers().add("eventType", OrderFinishedEvent.CONFIRMED.getBytes(StandardCharsets.UTF_8));
+        producer.send(record).get();
+
+        // The stream closes itself after a final status, which ends the list
+        assertThat(events.get(30, TimeUnit.SECONDS))
+                .containsExactly("data:{\"orderId\":\"" + orderId + "\",\"status\":\"PENDING\"}",
+                        "data:{\"orderId\":\"" + orderId + "\",\"status\":\"CONFIRMED\"}");
     }
 
     private UUID placeOrder() {

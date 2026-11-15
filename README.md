@@ -2750,3 +2750,40 @@ Nothing calls `OrderStatusStreams.send` for an order that changes while its stre
 the saga, possibly on another instance of order-service. The next step delivers it through Kafka. After inventory was
 started again, the pending order was cancelled by the saga, as before.
 
+## SSE 3: the broadcast listener
+
+`OrderStatusListener` reads `orders`. For `OrderConfirmed` and `OrderCancelled` it calls `OrderStatusStreams.send`, so
+an open stream gets the end of its order as it happens.
+
+**Broadcast, not work sharing.** The saga listeners of all instances share the group `order-service`, so each reply
+is handled once. This listener uses `order-service-status-${random.uuid}`, a new group per instance and per start, so
+every instance reads every event and tells the browsers connected to it. In RabbitMQ terms: a fanout exchange with a
+temporary queue per consumer.
+
+- `auto.offset.reset=latest`: a new group starts at the end of the topic. Old events are of no use to a stream; a
+  browser that missed one gets the status from the database when it reconnects.
+- Errors never reach the error handler. A broken event is logged and skipped. A lost notice costs a reconnect, while a
+  retry would block the partition, and `orders-dlt` does not exist.
+- Each start leaves an empty group behind. Kafka removes it when its offsets expire, after 7 days by default
+  (`offsets.retention.minutes`). Assigning the partitions by hand, without a group, would avoid that, at the cost of
+  knowing the partitions.
+
+**Test.** `statusStreamShowsTheEndOfAnOrder` opens a real HTTP stream for a pending order, writes an `OrderConfirmed`
+to `orders` as Debezium would, and expects exactly `PENDING`, then `CONFIRMED`, then the end of the stream. The test
+waits for the listener's partition assignment first, because the listener starts at the end of the topic. With the
+`send` call removed, the test failed with a timeout. All 5 order-service tests pass. The test class now starts a real
+web server on a random port.
+
+**Observed on Compose,** a stream opened right after `POST /orders`:
+
+| Order | Events | Stream closed |
+|---|---|---|
+| success | `PENDING` at 0 s, `CONFIRMED` at 2.7 s | 2.7 s |
+| payment over the limit | `PENDING` at 0 s, `CANCELLED` at 3.3 s | 3.3 s |
+| no stock | `PENDING` at 0 s, `CANCELLED` at 1.4 s | 1.4 s |
+
+The group `order-service-status-592048dc-...` appeared next to `order-service`.
+
+An `ERROR` in the test log comes from the saga timeout job at the very end of the run: Testcontainers stops Postgres
+before Spring stops the scheduler. It does not affect any test.
+
