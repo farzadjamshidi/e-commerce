@@ -2888,3 +2888,33 @@ crashed, because a Deployment removes an old pod only after a new one is ready.
 **Observed:** pod `Running`, compatibility `FULL_TRANSITIVE`, subject `com.ecommerce.inventory.StockReserved` version 1,
 topic `_schemas` with one partition, replication factor 3, compacted.
 
+## Kubernetes 8: a Docker image per service
+
+Each service now has its own `Dockerfile` and `.dockerignore`. Docker Compose describes how containers run together on
+one machine; a Dockerfile describes how one image is built. Kubernetes uses the images and its own resources, not
+Compose.
+
+**Two stages.** The first stage builds the jar with `eclipse-temurin:25-jdk` and the Maven wrapper. The second stage is
+`eclipse-temurin:25-jre` with only the application, so the image has no JDK, no Maven and no sources.
+
+- `RUN --mount=type=cache,target=/root/.m2` keeps downloaded dependencies between builds. The first image took 162 s,
+  mostly downloads; the next two took 8 s and 15 s.
+- Tests are skipped in the image build, because the Testcontainers tests need Docker. They run with `mvn test`.
+- `java -Djarmode=tools ... extract --layers --launcher` splits the Spring Boot jar into `dependencies`,
+  `spring-boot-loader`, `snapshot-dependencies` and `application`. Each is copied as its own image layer, from the one
+  that changes least to the one that changes most.
+- The process runs as user `app` (uid 1001), not root.
+- `-XX:MaxRAMPercentage=75` sizes the heap from the container's memory limit, not from the node's memory.
+
+**Why the layers matter.** Changing one line of code changes only the last layer, about 50 KB. The 87 MB of
+dependencies stay the same, so a node that already has the old image pulls only the small layer.
+
+**Observed:**
+
+- Images of about 450 MB each, of which 87 MB are dependencies and the rest is the JRE base image.
+- One constant added to `PaymentServiceApplication`: rebuilt in 5 s, `dependencies` and `spring-boot-loader` layers
+  identical, `application` layer changed. A first try added only a comment, which changed nothing, because comments do
+  not reach the bytecode.
+- `docker run` of the payment image started Spring Boot and stopped with `Connection to localhost:5432 refused`. The
+  image works; the database address is configured per environment in the next step.
+
