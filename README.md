@@ -2839,3 +2839,31 @@ replicas, but also another pod, and nothing new for Kafka.
 - The pod was deleted. A new pod with the same name `postgres-0` came up on the same volume, and a row written before
   was still there. The test table was dropped afterwards.
 
+## Kubernetes 6: Kafka Connect with Debezium
+
+**The image.** Strimzi's Kafka image has no connectors. `k8s/debezium/Dockerfile` starts from
+`quay.io/strimzi/kafka:1.3.1-kafka-4.2.2` and unpacks Debezium's Postgres connector 3.7.0.Final, the version used in
+Compose, into `/opt/kafka/plugins`. The outbox `EventRouter` comes in the same archive.
+
+Strimzi can also build such an image inside the cluster from a list of plugins in the `KafkaConnect` resource, but it
+needs an image registry to push to. Here the image is built on the laptop and copied into the kind nodes with
+`kind load docker-image`, so no registry is needed. `k8s/setup.sh connect` does both and applies the resource.
+
+**The resource.** `k8s/debezium/kafka-connect.yaml` defines `KafkaConnect` `debezium`: one worker, group
+`connect-cluster`, and the three state topics `connect-configs`, `connect-offsets` and `connect-status`, with
+replication factor 3. In Strimzi's `v1` API the group id and the topic names are fields of `spec`, not entries of
+`config`; the first apply was refused until they moved.
+
+The annotation `strimzi.io/use-connector-resources: "true"` makes the operator the owner of the connectors. They are
+added as `KafkaConnector` resources in the next step, instead of `curl` against the REST API. A connector created by
+hand through the API would be removed.
+
+**Observed:**
+
+- `KafkaConnect` `Ready`, pod `debezium-connect-0` running, REST API at `debezium-connect-api.kafka.svc:8083`.
+- The status lists `io.debezium.connector.postgresql.PostgresConnector 3.7.0.Final` among the plugins.
+- Connect created its topics itself: `connect-configs` (1 partition), `connect-offsets` (25), `connect-status` (5), all
+  compacted, replication factor 3.
+- From the Connect pod, `postgres.ecommerce.svc:5432` is reachable across namespaces. No connectors yet.
+- Memory of the three nodes together: about 4.7 GiB.
+

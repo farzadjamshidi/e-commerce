@@ -1,0 +1,34 @@
+# The connect container of docker-compose.yml. Connectors are added as KafkaConnector resources,
+# not with curl against the REST API.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnect
+metadata:
+  name: debezium
+  namespace: kafka
+  annotations:
+    # The operator owns the connectors: a connector made through the REST API by hand would be removed
+    strimzi.io/use-connector-resources: "true"
+spec:
+  version: 4.2.2
+  replicas: 1
+  # Built from k8s/debezium/Dockerfile and loaded with kind load, see k8s/setup.sh
+  image: ecommerce/kafka-connect-debezium:3.7.0
+  bootstrapServers: ecommerce-kafka-bootstrap:9092
+  # Workers with the same group id form one Connect cluster
+  groupId: connect-cluster
+  # Connect keeps its own state in Kafka topics, and creates them itself
+  configStorageTopic: connect-configs
+  offsetStorageTopic: connect-offsets
+  statusStorageTopic: connect-status
+  config:
+    config.storage.replication.factor: 3
+    offset.storage.replication.factor: 3
+    status.storage.replication.factor: 3
+  jvmOptions:
+    -Xms: 384m
+    -Xmx: 384m
+  resources:
+    requests:
+      memory: 768Mi
+    limits:
+      memory: 768Mi

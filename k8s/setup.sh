@@ -5,6 +5,7 @@
 #   k8s/setup.sh strimzi    the Strimzi operator, in the kafka namespace
 #   k8s/setup.sh kafka      the Kafka cluster, three nodes in KRaft mode, and its topics
 #   k8s/setup.sh postgres   Postgres with the three service databases, in the ecommerce namespace
+#   k8s/setup.sh connect    Kafka Connect with the Debezium Postgres connector
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -48,10 +49,19 @@ postgres() {
   kubectl -n ecommerce rollout status statefulset/postgres --timeout=300s
 }
 
+connect() {
+  # Built on this machine and copied into the kind nodes, so no image registry is needed
+  docker build -t ecommerce/kafka-connect-debezium:3.7.0 k8s/debezium
+  kind load docker-image ecommerce/kafka-connect-debezium:3.7.0 --name ecommerce
+  kubectl apply -f k8s/debezium/kafka-connect.yaml
+  kubectl -n kafka wait kafkaconnect/debezium --for=condition=Ready --timeout=600s
+}
+
 case "${1:-}" in
   cluster) cluster ;;
   strimzi) strimzi ;;
   kafka) kafka ;;
   postgres) postgres ;;
-  *) echo "usage: $0 cluster|strimzi|kafka|postgres" >&2; exit 1 ;;
+  connect) connect ;;
+  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect" >&2; exit 1 ;;
 esac
