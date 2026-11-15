@@ -3005,3 +3005,40 @@ cancelled. Nobody had to touch it.
 
 These times are one order each, not a measurement.
 
+## Kubernetes 11: a broker killed under load
+
+**The test.** 100 orders, one every 0.5 s. After 28 orders, `ecommerce-dual-role-1` was force deleted
+(`--grace-period=0 --force`), like a crash. Broker 1 was the KRaft quorum leader and led partition 0 of every saga
+topic.
+
+**What the operator and Kafka did:**
+
+- Within 4 s broker 2 was the new quorum leader.
+- The `StrimziPodSet` created a new `ecommerce-dual-role-1` at once, on the same node and the same volume. It was ready
+  23 s after the kill, and replication caught up a second later: no under-replicated partitions.
+- Afterwards broker 2 led all three partitions of `payments`. Kafka moves leadership back to the preferred replica only
+  later (`auto.leader.rebalance.enable`, checked every five minutes).
+
+**What happened to the orders:**
+
+| Created | Orders | Average | Slowest |
+|---|---|---|---|
+| before the kill | 26 | 2.3 s | 3.1 s |
+| in the 25 s after it | 48 | 8.6 s | 18.8 s |
+| after recovery | 26 | 2.9 s | 6.3 s |
+
+All 100 orders `CONFIRMED`, 100 reservations, 100 payments, every HTTP call `202`, nothing on any DLT, no duplicate
+skipped by an inbox, no service restarted. The outage became delay, not loss: the API only writes to Postgres, and the
+outbox rows waited in the WAL until Kafka took writes again.
+
+**Found: a second broker died, killed for memory.** Broker 0 restarted once during the test, which was not part of
+the plan. Its last state was `OOMKilled`, exit 137, 8 s after broker 1 was killed. With two of three brokers down,
+`min.insync.replicas=2` could not be met, so writes with `acks=all` were refused until one came back. That explains
+the 18.8 s orders, and why two status checks made through broker 0 returned nothing.
+
+The limit was 768 MiB with a 384 MiB heap. A broker uses memory outside the heap too: metaspace, thread stacks and
+network buffers, which grow when it takes over partitions and connections from a dead broker. After the test, broker
+2 used 764 of its 768 MiB, 628 MiB of it not page cache. The limit leaves no room for a failover.
+
+The lesson: a memory limit sized for the quiet state turns one failure into two. The next step raises it.
+
