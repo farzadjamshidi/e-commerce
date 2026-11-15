@@ -1,0 +1,13 @@
+# Local cluster: one control plane and two workers, each a Docker container.
+# Two workers let the Kafka pods be spread, so losing one node can be tested.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ecommerce
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # order-service's API, exposed later as a NodePort, reachable at localhost:8081
+      - containerPort: 30081
+        hostPort: 8081
+  - role: worker
+  - role: worker

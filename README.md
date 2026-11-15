@@ -2679,3 +2679,39 @@ Version 2 was a test change. The file is back to the original and version 2 was 
 **Why this order matters.** A schema now reaches the registry only after a compatibility check, and a service cannot
 write a message with a schema that is not there. The check happens at build time, before any message exists.
 
+## Kubernetes 1: a local cluster with kind
+
+This part runs everything on Kubernetes, on the `kubernetes` branch. Docker Compose stays for local development.
+Kubernetes files live in `k8s/`.
+
+**Tools:**
+
+- **Kubernetes** runs containers across machines, keeps them alive and scales them. It is told what should exist,
+  and it keeps working until that is true.
+- **kind** (Kubernetes in Docker) makes each node of the cluster a Docker container. Version `v0.33.0`, Kubernetes
+  `v1.37.0`.
+- **kubectl** is the command line client of the cluster.
+- **Strimzi** (next steps) is an operator: it runs Kafka from YAML that says what is wanted.
+- **KEDA** (later) scales consumers from the lag.
+
+**The cluster** (`k8s/kind-config.yaml`): one control plane and two workers. Two workers let Kafka pods be spread
+over nodes, so losing a node can be tested. With three Kafka nodes and two workers, two of them share a worker.
+Port 30081 of the control plane maps to `localhost:8081`, for order-service's API later.
+
+```bash
+docker compose stop                                   # one Kafka at a time
+kind create cluster --config k8s/kind-config.yaml
+kubectl get nodes
+kind delete cluster --name ecommerce                  # remove everything
+```
+
+`local-path-provisioner` and its `standard` storage class come with kind. A pod that asks for a disk gets a folder on
+its node.
+
+**Observed:** three nodes `Ready`, all `kube-system` pods running. The three node containers used about 920 MiB right
+after start. The Compose stack had used about 3.5 GiB, out of 7.7 GiB given to Docker.
+
+**Docker Desktop stopped by itself four times during the earlier steps.** Its log shows a clean idle shutdown, not a
+lack of memory: `idle mode activated ... dockerd has exited successfully ... idle: shutdown`. The settings have
+`UseResourceSaver: true`. Turning Resource Saver off in Docker Desktop avoids it.
+
