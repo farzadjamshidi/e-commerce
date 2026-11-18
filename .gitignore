@@ -20,3 +20,6 @@ build/
 
 # Logs
 *.log
+
+# Local run: service logs and process ids
+.run/
