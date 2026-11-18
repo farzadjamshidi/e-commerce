@@ -10,6 +10,11 @@
 #   k8s/setup.sh services   images of the three services, and their Deployments
 #   k8s/setup.sh connectors the Debezium connectors, after the services have created the publications
 #   k8s/setup.sh keda       KEDA, and the autoscaling of inventory-service by consumer lag
+#
+#   k8s/setup.sh all        every step above, in order
+#   k8s/setup.sh stop       stop the cluster's containers; everything is kept
+#   k8s/setup.sh start      start them again and wait until the system is back
+#   k8s/setup.sh delete     delete the cluster and all its data
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -99,6 +104,45 @@ keda() {
   kubectl apply -f k8s/keda/inventory-scaledobject.yaml
 }
 
+all() {
+  cluster
+  strimzi
+  kafka
+  postgres
+  connect
+  registry
+  services
+  connectors
+  keda
+  echo
+  echo "ready: API at http://localhost:8081/orders, examples in HOW_TO_RUN.md"
+}
+
+stop() {
+  # shellcheck disable=SC2046
+  docker stop $(kind get nodes --name ecommerce)
+}
+
+start() {
+  # shellcheck disable=SC2046
+  docker start $(kind get nodes --name ecommerce)
+  # Right after the containers start, the API server refuses requests until it has loaded its roles
+  until kubectl get nodes >/dev/null 2>&1; do
+    echo "waiting for the API server..."
+    sleep 3
+  done
+  kubectl wait --for=condition=Ready nodes --all --timeout=180s
+  # Statuses are stale right after a start: they still say ready from before the stop. The services restart until
+  # Kafka and Postgres are back, so wait for an answer from the API itself, then for every pod.
+  until curl -sf localhost:8081/actuator/health >/dev/null; do
+    echo "waiting for the services..."
+    sleep 5
+  done
+  kubectl -n kafka wait pod --all --for=condition=Ready --timeout=600s
+  kubectl -n ecommerce wait pod --all --for=condition=Ready --timeout=300s
+  echo "ready: API at http://localhost:8081/orders"
+}
+
 case "${1:-}" in
   cluster) cluster ;;
   strimzi) strimzi ;;
@@ -109,5 +153,10 @@ case "${1:-}" in
   services) services ;;
   connectors) connectors ;;
   keda) keda ;;
-  *) echo "usage: $0 cluster|strimzi|kafka|postgres|connect|registry|services|connectors|keda" >&2; exit 1 ;;
+  all) all ;;
+  stop) stop ;;
+  start) start ;;
+  delete) kind delete cluster --name ecommerce ;;
+  *) echo "usage: $0 all|stop|start|delete, or one step: cluster|strimzi|kafka|postgres|connect|registry|services|connectors|keda" >&2
+     exit 1 ;;
 esac
